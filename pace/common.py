@@ -42,6 +42,8 @@ __all__ = [
     "Checkpoint", "Manifest", "load_manifest",
     "MODEL_COLORS", "MODEL_LABELS", "MODEL_ORDER", "CONVENTIONAL_MODELS",
     "style_of", "color_of", "label_of", "ordered_models",
+    "marker_of", "marker_size_of", "linestyle_of", "clean_spines",
+    "PARAM_LATEX", "ground_truth_cnr",
     "TISSUE_COLORS", "TISSUE_ORDER", "decode_tissue", "decode_tissue_array",
     "PARAM_NAMES", "PARAM_ORDER_FIGURE", "PARAM_UNITS",
     "ivim_signal_3c", "reconstruct_signal",
@@ -51,7 +53,8 @@ __all__ = [
     "load_ground_truth", "result_schema_report",
     "build_signal_rmse_df", "build_param_rmse_df", "build_cnr_df",
     "MRM_RC", "MRM_SINGLE_COL_MM", "MRM_DOUBLE_COL_MM",
-    "apply_mrm_style", "figure_size", "save_figure", "darken",
+    "apply_mrm_style", "figure_size", "save_figure",
+    "darken", "darken_hex",
 ]
 
 
@@ -330,7 +333,9 @@ MODEL_COLORS = {
     "cnn_fusion":            "#e76f51",
     "lsq":                   "#2a9d8f",
     "nnls":                  "#d4a017",
-    "map":                   "#6a4c93",
+    # MAP is brown rather than the #6a4c93 purple used in older versions
+    # of the analysis, which separates it from PACE.
+    "map":                   "#8c510a",
     # ablation variants
     "pace_recon":            "#264653",
     "pace_nosimplex":        "#8d99ae",
@@ -353,13 +358,14 @@ MODEL_LABELS = {
     "dnn_simplex":           "DNN (SM)",
 }
 
-# Plot order: conventional first, then neural, headline last so the
-# proposed method draws on top.
+# Plot order, matching FIG1_MODEL_ORDER, FIG2_MODEL_ORDER and
+# FIG3_MODEL_ORDER in the analysis: the proposed models first, then the
+# baselines. Ablation variants sit beside the family they belong to.
 MODEL_ORDER = [
-    "lsq", "nnls", "map",
+    "pace", "pace_recon", "pace_nosimplex", "pace_recon_nosimplex",
+    "cnn_fusion", "cnn_fusion_nosimplex",
     "dnn", "dnn_simplex",
-    "cnn_fusion_nosimplex", "cnn_fusion",
-    "pace_nosimplex", "pace_recon_nosimplex", "pace_recon", "pace",
+    "lsq", "nnls", "map",
 ]
 
 CONVENTIONAL_MODELS = {"lsq", "nnls", "map"}
@@ -383,6 +389,27 @@ def style_of(model: str) -> dict:
         "linewidth": lw,
         "label": MODEL_LABELS.get(model, model),
     }
+
+
+def marker_of(model: str) -> str:
+    """Triangles for conventional fitters, circles for learned models."""
+    return "^" if model in CONVENTIONAL_MODELS else "o"
+
+
+def marker_size_of(model: str) -> int:
+    """Triangles read smaller than circles at equal point size."""
+    return 6 if model in CONVENTIONAL_MODELS else 5
+
+
+def linestyle_of(model: str) -> str:
+    return "--" if model in CONVENTIONAL_MODELS else "-"
+
+
+def clean_spines(ax, top=False, right=False):
+    """Hide the top and right spines and add a subtle grid."""
+    ax.spines["top"].set_visible(top)
+    ax.spines["right"].set_visible(right)
+    ax.grid(True, alpha=0.15)
 
 
 def color_of(model: str) -> str:
@@ -444,6 +471,15 @@ PARAM_NAMES = ["Dpar", "Dint", "Dmv", "Fint", "Fmv", "S0"]
 # Figure column order groups by compartment: parenchymal, interstitial,
 # then microvascular.
 PARAM_ORDER_FIGURE = ["Dpar", "Dint", "Fint", "Dmv", "Fmv", "S0"]
+
+PARAM_LATEX = {
+    "Dpar": r"$D_\mathrm{par}$",
+    "Dint": r"$D_\mathrm{int}$",
+    "Dmv":  r"$D_\mathrm{mv}$",
+    "Fint": r"$f_\mathrm{int}$",
+    "Fmv":  r"$f_\mathrm{mv}$",
+    "S0":   r"$S_0$",
+}
 
 PARAM_UNITS = {
     "Dpar": "mm$^2$/s", "Dint": "mm$^2$/s", "Dmv": "mm$^2$/s",
@@ -821,6 +857,25 @@ def load_ground_truth(split: str = "test", paths: Paths | None = None) -> dict:
     return out
 
 
+@lru_cache(maxsize=4)
+def ground_truth_cnr(pair=("WMH", "NAWM"), split: str = "test",
+                     paths: Paths | None = None) -> dict:
+    """Reference CNR computed once from the global ground truth.
+
+    The analysis compares every model against a single reference value per
+    parameter rather than against a per file recomputation, so this is
+    deliberately independent of any model's valid mask.
+    """
+    g = load_ground_truth(split, paths)
+    if "Tissue" not in g or "Lesion" not in g:
+        raise KeyError(f"the {split} split carries no Tissue or Lesion arrays")
+    labels = decode_tissue_array(g["Tissue"], g["Lesion"])
+    a, b = pair
+    ma, mb = labels == a, labels == b
+    return {p: cnr_magnotta(g[p][ma], g[p][mb])
+            for p in PARAM_NAMES if p in g}
+
+
 def result_schema_report(paths: Paths | None = None) -> dict:
     """Group every result file by its exact key set, for diagnostics."""
     import h5py
@@ -1016,7 +1071,23 @@ def save_figure(fig, name, paths=None, formats=("png", "pdf"), dpi=600):
 
 
 def darken(color, factor=0.6):
-    """Darken a colour toward black. factor 1.0 leaves it unchanged."""
+    """Darken a colour toward black, returning an RGB tuple.
+
+    factor 1.0 leaves it unchanged, 0.0 gives black.
+    """
     import matplotlib.colors as mcolors
     r, g, b = mcolors.to_rgb(color)
     return (r * factor, g * factor, b * factor)
+
+
+def darken_hex(hex_color, factor=0.6):
+    """Darken a hex colour, returning a hex string.
+
+    Carried unchanged from the analysis, including its integer
+    truncation, so that annotation and limit-of-agreement line colours
+    match the published figures exactly.
+    """
+    h = hex_color.lstrip("#")
+    rgb = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    dark = tuple(int(c * factor) for c in rgb)
+    return f"#{dark[0]:02x}{dark[1]:02x}{dark[2]:02x}"
