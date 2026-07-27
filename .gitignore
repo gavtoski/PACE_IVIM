@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------
+# PACE_IVIM
+# ---------------------------------------------------------------
+
+# Working directories, never committed
+_inventory/
+_private/
+
+# Safety net: block any path carrying an NC subject identifier.
+# The synthetic release contains none. If one of these ever matches,
+# something from the in-vivo cohort has leaked into the tree.
+*NC[0-9][0-9][0-9]*
+
+# In-vivo, out of scope for this repository
+**/Subject_Dictionary*/
+**/Trained_Nets_Invivo*/
+**/Inferred_Results_Invivo*/
+**/Training_Data_Invivo/
+
+# Brain maps, deferred
+**/Synthetic_Brain_Maps*/
+
+# Regenerable caches
+*.pkl
+cache_*
+**/cache_Nv4_*.npz
+
+# Training data too large for git, and only needed to retrain
+synthetic_IVIM_train_2D.h5
+*_500000.npz
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+._*
+
+# Editors
+.vscode/
+.idea/
