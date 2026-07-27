@@ -1,0 +1,22 @@
+# Copy to configs/paths.yaml and edit. paths.yaml is gitignored.
+#
+# Paths may be absolute, or relative to the repository root.
+
+repo_root: .
+
+data:
+  synthetic_test: data/synthetic/synthetic_IVIM_test_2D.h5
+  synthetic_val:  data/synthetic/synthetic_IVIM_val_2D.h5
+  bvals:          data/synthetic/bval46.bval
+
+checkpoints:
+  synthetic: checkpoints/synthetic
+
+results:
+  synthetic: results/synthetic
+
+figures: figures
+
+# Inference
+device: cuda        # cuda, mps or cpu
+batch_size: 512
