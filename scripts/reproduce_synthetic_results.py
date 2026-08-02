@@ -70,6 +70,70 @@ PRED_KEYS = ["Dpar_pred", "Fint_pred", "Dint_pred", "Fmv_pred", "Dmv_pred",
              "S0_pred"]
 
 
+class InMemoryIVIMDataset:
+    """IVIMDataset equivalent that reads the H5 once instead of per voxel.
+
+    IVIMDataset.__getitem__ indexes the open HDF5 file five times for every
+    voxel, so a 38,000 voxel pass performs 190,000 reads against gzip
+    compressed datasets. Loading each array once and slicing it in memory
+    gives identical values roughly two orders of magnitude faster. The
+    synthetic test file is about 11 MB uncompressed.
+
+    The per voxel transform is copied from IVIMDataset so the two produce
+    the same tensors: z-scoring is applied to each structural channel and
+    to the b0 patch, and the zeroed placeholders keep their exact shapes
+    when a modality is switched off.
+    """
+
+    def __init__(self, h5_path, use_struct=True, use_b0=True):
+        import h5py
+        from pace.deep_models import zscore_patch_np
+
+        self._zscore = zscore_patch_np
+        self.use_struct, self.use_b0 = use_struct, use_b0
+
+        with h5py.File(h5_path, "r") as f:
+            self.X = f["IVIM_cube"][:].astype(np.float32)
+            self.SP = f["Struct_patch"][:].astype(np.float32)
+            self.B0 = f["B0_patch"][:].astype(np.float32)
+            self.T = f["Tissue"][:]
+            self.L = f["Lesion"][:]
+
+        self.nbvals = self.X.shape[-1]
+        self._zero_sp = np.zeros((2, 3, 3), dtype=np.float32)
+        self._zero_b0 = np.zeros((1, 3, 3), dtype=np.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        import torch
+
+        if self.use_struct:
+            sp = self.SP[idx].copy()
+            sp[0] = self._zscore(sp[0])
+            sp[1] = self._zscore(sp[1])
+        else:
+            sp = self._zero_sp
+
+        if self.use_b0:
+            b0 = self.B0[idx].copy()
+            b0[0] = self._zscore(b0[0])
+        else:
+            b0 = self._zero_b0
+
+        return {
+            "x_true": torch.from_numpy(self.X[idx]),
+            "struct_patch": torch.from_numpy(sp),
+            "b0_patch": torch.from_numpy(b0),
+            "tissue": torch.tensor(int(self.T[idx]), dtype=torch.int16),
+            "lesion": torch.tensor(int(self.L[idx]), dtype=torch.int16),
+        }
+
+    def close(self):
+        pass
+
+
 def _tissue_key(model):
     return "Tissue"
 
@@ -79,7 +143,7 @@ def run_one(ck, paths, device, batch_size, out_root, overwrite, quiet=False):
     import h5py
     import torch
     from torch.utils.data import DataLoader
-    from pace.deep_models import IVIMDataset, clean_ivim_signals
+    from pace.deep_models import clean_ivim_signals
 
     out_dir = out_root / f"{ck.model}_snr{ck.snr_db}"
     out_path = out_dir / f"inferred_seed{ck.seed}.h5"
@@ -95,10 +159,9 @@ def run_one(ck, paths, device, batch_size, out_root, overwrite, quiet=False):
     net, _ = C.load_net(ck.model, ck.snr_db, ck.seed, bvals=bvals,
                         device=device, paths=paths, strict=True)
 
-    ds = IVIMDataset(str(paths.synthetic_test),
-                     use_struct=cfg["use_struct"],
-                     use_b0=cfg["use_b0"],
-                     use_2d_struct=True)
+    ds = InMemoryIVIMDataset(str(paths.synthetic_test),
+                             use_struct=cfg["use_struct"],
+                             use_b0=cfg["use_b0"])
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                         num_workers=0, drop_last=False)
     n_batches = len(loader)
