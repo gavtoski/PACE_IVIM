@@ -2,28 +2,6 @@
 # pace.learn_ivim.py
 # Bin Hoang | University of Rochester | Feb 2026
 # Training for Tissue Token IVIM — Per-Parameter Gating + Y-Branch.
-#
-# Changes (Mar 12 2026):
-#   - Added use_ordered_diffusion and use_softmax_fractions pass-through
-#     to Net() for R21 identifiability fix. Default True.
-#     use_softmax_fractions auto-disabled when spatial_on=False (DNN mode).
-#
-# Changes (Mar 1 2026):
-#   - CE warmup: ce_warmup_start/ce_warmup_length for delayed CE activation
-#     (R9_CEWarmup uses ce_warmup_start=10 to let signal converge first)
-#
-# Changes (Feb 27 2026):
-#   - Per-parameter spatial gating (6 gates: Dpar, Fint, Dint, Fmv, Dmv, S0)
-#   - detach_spatial_delta: isolates IVIM encoder from attention gradients
-#   - Separate param groups (IVIM slow, spatial fast) via pace.training_utils
-#   - Delayed cosine scheduler (warmup → hold → decay)
-#   - freeze_spatial_gates() replaces old freeze_perf_gate hack
-#   - Tracks all 6 gate values in history
-#
-# Previous changes (Feb 25 2026):
-#   - Static sqrt-inverse-freq CE weights (dataset-level, no batch thrash)
-#   - Recon warmup: CE active from epoch 0, recon ramps in after warmup_start
-#   - Updated default alphas: alpha_ce=0.2, alpha_recon=0.05
 
 import sys, os, copy, time, argparse
 import numpy as np
