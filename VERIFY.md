@@ -1,7 +1,7 @@
 # Verifying the released results
 
 Checks that the trained networks in this repository produce the numbers
-reported in the manuscript. Runs on a laptop, no GPU, about ten minutes.
+reported in the manuscript. 
 
 ## 1. Setup
 
@@ -55,8 +55,8 @@ Expected: `24 checkpoints, 0 failures`
 
 ## 4. Reproduce the results
 
-Loads each checkpoint, runs it on the test set, compares against
-`results/synthetic`. Two to three minutes.
+Loads each checkpoint, runs it on the test set, and compares against
+`results/synthetic`. Takes about two to three minutes.
 
 ```bash
 python scripts/reproduce_synthetic_results.py --compare
@@ -74,20 +74,8 @@ overwritten.
 | 25 dB | under 0.7 % | about 37,910 |
 | 20 dB | 2 to 3 %    | 37,025 |
 
-Voxel level equality is not expected. Rician noise is injected at
-inference and the random stream depends on the compute backend, so a run
-on Metal or CPU retains a different subset of voxels than the original
-CUDA run and sees different noise. That is why agreement degrades as SNR
-falls: at 35 dB nothing is rejected and both runs evaluate the same
-voxels; at 20 dB about 975 differ.
-
-Two signs the difference is noise and not error: the retained voxel count
-is identical across all three neural models at a given SNR, since
-rejection happens before the network sees the data; and at 20 dB all six
-parameters shift the same direction together.
-
-Above 5 percent, or one model disagreeing while the others match, would
-mean something else.
+Voxel-level equality is not expected due to injected Rician noise, but the output
+results should be close to the reference.
 
 ## 5. Regenerate the figures
 
@@ -99,10 +87,10 @@ Reads `results/synthetic`, writes `figures/`. No GPU or PyTorch needed.
 
 | Figure | Content |
 |--------|---------|
-| 1   | Signal RMSE against SNR, ranked mean, residual against b-value |
-| 2.0 | Parameter RMSE against SNR, lines |
-| 2.1 | Parameter RMSE, bars |
-| 2.2 | Bland Altman against ground truth |
+| 1   | Signal RMSE against SNR, across all b-value range |
+| 2.0 | Parameter RMSE against SNR |
+| 2.1 | Parameter RMSE, bar plot |
+| 2.2 | Bland-Altman against ground truth |
 | 3.1 | WMH against NAWM lesion CNR |
 | 4.1 | Learned spatial gate values |
 
@@ -118,59 +106,6 @@ random:
 6.  NNLS        0.02814 +/- 0.00754
 ```
 
-Two notes. Figures 2.0 and 2.1 differ slightly by design: 2.0 pools
-tissues and seeds in one average, 2.1 collapses tissues within each
-(SNR, seed) first. Figure 4.1 reads the training logs under
-`checkpoints/synthetic/logs/` rather than the inference results.
-
-## 6. Check the architecture flags
-
-Three flags change what a network computes without changing any parameter
-shape, so a checkpoint loads cleanly into a wrongly configured network and
-returns different numbers. They are recorded per checkpoint in
-`configs/models.json`, and each is independently checkable.
-
-```bash
-python -c "
-from pace import common as C
-import torch
-for m in ['dnn','pace','cnn_fusion']:
-    k = torch.load(f'checkpoints/synthetic/{m}_snr25_seed19.pt',
-                   map_location='cpu', weights_only=True).keys()
-    fusion = ('concat'    if any('cross_attn.proj' in x for x in k) else
-              'attention' if any('cross_attn.in_proj_weight' in x for x in k)
-              else 'none')
-    p = C.load_result(m, 25, 19); ok = p.valid()
-    frac = (p.params['Fint'][ok] + p.params['Fmv'][ok]).max()
-    dint = p.params['Dint'][ok].min()
-    print(f'{m:<12} fusion={fusion:<10} '
-          f'{\"softmax\" if frac > 0.6 else \"sigmoid\":<8} '
-          f'{\"ordered\" if dint < 0.0015 else \"independent\"}')
-"
-```
-
-Expected:
-
-```
-dnn          fusion=none       sigmoid  independent
-pace         fusion=attention  softmax  ordered
-cnn_fusion   fusion=concat     softmax  ordered
-```
-
-Why each test works:
-
-- **fusion_mode** is in the weight names. Cross attention stores
-  `cross_attn.in_proj_weight`, concat stores `cross_attn.proj`, and a
-  signal only model has neither.
-- **softmax** caps `Fint + Fmv` at 1. The sigmoid alternative caps them at
-  0.4 and 0.2, so a sum above 0.6 can only come from softmax.
-- **ordered** makes `Dint = Dpar + softplus(...)`, so `Dint` inherits
-  `Dpar`'s floor and can fall below 0.0015. Without it `Dint` has its own
-  hard floor at 0.0015.
-
-Checking `Dpar < Dint < Dmv` does **not** distinguish them: the bound
-ranges are disjoint, so that holds either way.
-
 ## Not included
 
 The in-vivo cohort is protected health information and cannot be shared,
@@ -178,11 +113,3 @@ so the in-vivo code and the brain map experiments are outside this
 repository. The training set is also excluded; it is needed only to
 retrain, and is available on request.
 
-## Problems
-
-Open an issue at https://github.com/gavtoski/PACE_IVIM/issues with the
-command, the output, and:
-
-```bash
-python -c "import sys, torch, numpy; print(sys.version, torch.__version__, numpy.__version__)"
-```
