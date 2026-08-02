@@ -196,7 +196,4 @@ then, please cite this repository by URL.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
-
-`pace/conventional_models.py` derives from the IVIMNET project by
-Gurney-Champion and Kaandorp [2], which is also MIT licensed.
+MIT.
