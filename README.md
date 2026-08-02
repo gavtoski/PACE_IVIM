@@ -32,8 +32,7 @@ into the next. **[VERIFY.md](VERIFY.md)** walks through confirming that the
 released checkpoints reproduce the reported numbers, in about ten minutes
 on a laptop.
 
-The complete repository will be released once the associated manuscript
-has been accepted.
+As a gesture of good faith, the complete repository was released early to aid the reviewing process.
 
 ## Models
 
