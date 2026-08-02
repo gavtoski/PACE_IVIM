@@ -59,7 +59,7 @@ configuration and provenance.
 ```
 pace/          library code shared by the scripts
 scripts/       make_manuscript_figures, reproduce_synthetic_results,
-               train_synthetic
+               train_synthetic, compare_retrained
 configs/       model manifest and path configuration
 checkpoints/   trained weights
 data/          synthetic test and validation sets
@@ -142,12 +142,38 @@ python scripts/reproduce_synthetic_results.py --models pace --snrs 25 --seeds 19
     --out results/synthetic_from_retrained
 ```
 
+Then compare the two side by side:
+
+```bash
+python scripts/compare_retrained.py
+```
+
+This ranks all six methods on signal RMSE and each parameter, using the
+retrained value for the neural models and the released value for the
+conventional ones, which have no weights to retrain. It restricts both
+sides to the seeds present on the retrained side so the comparison is like
+for like, and writes `figures/released_vs_retrained.png`.
+
 Retraining does not reproduce the released weights exactly. Dropout,
 shuffling and noise injection draw from a random stream that differs by
-compute backend, and 35 epochs compound it. In our own check, twelve
-retrained configurations landed within roughly 20 percent of the released
-validation MSE, parameter RMSE agreed to within 8 percent, and the learned
-spatial gates matched to three decimal places.
+compute backend, and 35 epochs compound it. What should hold is where
+training lands and how the methods rank.
+
+In our own check, retraining all three neural models at four SNR levels
+and one seed:
+
+- validation MSE within roughly 20 percent of the released run
+- parameter RMSE within 8 percent
+- learned spatial gates matching to three decimal places
+- PACE and CNN Fusion still first and second on signal RMSE, Dpar, Fint
+  and Fmv
+
+Two rankings are worth reading carefully rather than taken as a pass. The
+conventional Bayesian and spectral fits lead on Dint in both the released
+and retrained results, so that is a property of the comparison rather than
+of retraining. And on Fint the two spatial models swap order between the
+runs, by less than the training variance, so a single seed does not
+separate them.
 
 ## Data availability
 

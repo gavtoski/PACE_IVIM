@@ -195,6 +195,8 @@ def _forward_pass(net, loader, cfg, bvals, dev, ck, n_batches, quiet):
 
             vm_np = vm.cpu().numpy().astype(bool)
             valid_chunks.append(vm_np)
+            tissue.append(batch["tissue"].numpy())
+            lesion.append(batch["lesion"].numpy())
             if X.shape[0] < 1:
                 continue
 
@@ -210,8 +212,7 @@ def _forward_pass(net, loader, cfg, bvals, dev, ck, n_batches, quiet):
             if Dint is not None:
                 preds["Dint_pred"].append(Dint.cpu().numpy().ravel())
 
-            tissue.append(batch["tissue"].numpy()[vm_np])
-            lesion.append(batch["lesion"].numpy()[vm_np])
+
 
     if not quiet:
         print(flush=True)
@@ -232,14 +233,38 @@ def _report_progress(bi, n_batches, t0, quiet):
 def _assemble(preds, tissue, lesion, valid_chunks, bvals):
     """Concatenate the per batch arrays into the output dictionary.
 
-    Valid_mask spans every input voxel, so it is deliberately longer than
-    the prediction arrays, which cover only the voxels that survived.
+    Every array spans all input voxels, matching the schema of the
+    committed results. Predictions exist only for voxels that survived
+    cleaning, so they are scattered back into a full length array with
+    zero in the rejected positions and Valid_mask recording which those
+    are. Zero rather than NaN because that is what the released files
+    use, and a reader comparing the two should find them identical in
+    form as well as length.
     """
-    save = {k: np.concatenate(v) for k, v in preds.items() if v}
+    valid = np.concatenate(valid_chunks)
+    n = len(valid)
+
+    save = {}
+    for key, chunks in preds.items():
+        if not chunks:
+            continue
+        kept = np.concatenate(chunks)
+        if len(kept) != int(valid.sum()):
+            raise ValueError(
+                f"{key}: {len(kept)} predictions for {int(valid.sum())} "
+                f"valid voxels")
+        full = np.zeros(n, dtype=np.float32)
+        full[valid] = kept
+        save[key] = full
+
     save["Tissue"] = np.concatenate(tissue)
     save["Lesion"] = np.concatenate(lesion)
-    save["Valid_mask"] = np.concatenate(valid_chunks).astype(np.uint8)
+    save["Valid_mask"] = valid.astype(np.uint8)
     save["bvals"] = np.asarray(bvals, dtype=np.float32)
+
+    for k in ["Tissue", "Lesion"]:
+        if len(save[k]) != n:
+            raise ValueError(f"{k} has {len(save[k])} rows, expected {n}")
     return save
 
 
@@ -284,14 +309,13 @@ def run_one(ck, paths, device, batch_size, out_root, overwrite,
         print(flush=True)
 
     save = _assemble(preds, tissue, lesion, valid_chunks, bvals)
-    n_kept = len(save["Dpar_pred"])
     n_total = len(save["Valid_mask"])
+    n_kept = int(save["Valid_mask"].sum())
 
-    lengths = {len(v) for k, v in save.items() if k not in ("bvals",)}
-    lengths.discard(n_total)  # Valid_mask is full length by design
-    if len(lengths) > 1:
+    lengths = {len(v) for k, v in save.items() if k != "bvals"}
+    if lengths != {n_total}:
         raise ValueError(f"{ck.public_name}: inconsistent array lengths "
-                         f"{sorted(lengths)}")
+                         f"{sorted(lengths)}, expected all {n_total}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     with h5py.File(out_path, "w") as f:
