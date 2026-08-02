@@ -3,12 +3,6 @@
 # pace.training_utils.py
 # Training dynamics helpers for IVIM tissue-token network.
 #
-# Two fixes (both reviewers flagged as free wins):
-#   1. Separate param groups: IVIM encoder learns slowly (1e-4),
-#      spatial/CE/gates learn faster (5e-4).
-#   2. Delayed scheduler: no LR decay until spatial tasks have
-#      converged (prevents premature freezing of recon/CE).
-#
 # Usage:
 #   from pace.training_utils import build_param_groups, build_scheduler
 #
