@@ -19,9 +19,9 @@ order with the proposed methods first.
 
 Usage
 -----
-    python scripts/make_figures.py
-    python scripts/make_figures.py --figures 1 2.1
-    python scripts/make_figures.py --snrs 25 30 35
+    python scripts/make_manuscript_figures.py
+    python scripts/make_manuscript_figures.py --figures 1 2.1
+    python scripts/make_manuscript_figures.py --snrs 25 30 35
 """
 
 from __future__ import annotations
