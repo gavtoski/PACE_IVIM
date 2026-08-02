@@ -5,16 +5,16 @@
 # Tissue Token IVIM — PACE (Per-parameter Anatomically Conditioned Estimation)
 # -----------------------------------------------------------
 #
-# Architecture (April 2026 — spatial-only K,V + interpolation gating):
+# Architecture notes:
 #
 #   Modality encoders produce [z_ivim, z_T1, z_FLAIR, z_b0].
 #
-#   ANATOMY TOKEN (Feb 27 2026 — from CMAF-Net modality grouping):
+#   ANATOMY TOKEN:
 #     z_anat = fusion_proj(cat[z_T1, z_FLAIR])
 #     T1 and FLAIR together define tissue state (GM/NAWM/WMH).
 #     Fusing them into one token prevents attention from wasting
 #     capacity weighing image contrasts against each other.
-#     Y-branch still uses raw [z_T1 | z_FLAIR | z_B0] for recon.
+# 
 #
 #   CROSS-ATTENTION — spatial-only K,V (April 2026):
 #     K,V sequence: [z_anat, z_b0] (spatial tokens only).
@@ -24,16 +24,11 @@
 #     Previous design had z_ivim in K,V which let attention "hide"
 #     by self-attending, duplicating the per-parameter gates' job.
 #
-#   SPATIAL BOTTLENECK — fixed-order concat (widened):
-#     spatial_concat = [z_T1 | z_FLAIR | z_B0]  (dim = 3*D)
-#     Zero-filled for missing/dropped modalities.
-#     Wider than mean-pool → preserves per-modality identity.
-#
 #   Y-BRANCH (gradient isolation):
 #     token_recon = recon_proj(spatial_concat)  → recon decoders
 #     token_ce    = ce_proj(spatial_concat)     → tissue classifier
 #     Separate projections so recon and CE learn different features
-#     from the same spatial input without competing.
+#     from the same spatial input without competing. 
 #
 #   PER-PARAMETER SPATIAL GATING — eq (5) in methodology:
 #     z_fused = LayerNorm(z_ivim_q + α · CrossAttn(Q, K, V))
@@ -48,27 +43,6 @@
 #       Dpar, Dint, Fint, S0: -5.0  → σ ≈ 0.007 (nearly closed)
 #       Fmv, Dmv:             -2.0  → σ ≈ 0.12  (open to spatial)
 #       Configurable via gate_inits argument to Net()
-#
-#   R21 IDENTIFIABILITY FIX (March 2026):
-#     Two architectural changes to eliminate Fint-Fmv degeneracy:
-#
-#     1. HARD DIFFUSIVITY ORDERING (use_ordered_diffusion, default ON):
-#        Dpar = floor + softplus(Dpar_head)
-#        Dint = Dpar  + softplus(Dint_head)   → guaranteed > Dpar
-#        Dmv  = Dint  + softplus(Dmv_head)    → guaranteed > Dint
-#        Each head still predicts independently, but its output is
-#        interpreted as a gap above the previous compartment.
-#        Makes compartment swapping architecturally impossible.
-#
-#     2. SOFTMAX FRACTION SIMPLEX (use_softmax_fractions, default ON):
-#        Adds Fpar_head. All three fraction logits pass through softmax:
-#        [Fpar, Fint, Fmv] = softmax([Fpar_head, Fint_head, Fmv_head] / T)
-#        Guarantees Fpar + Fint + Fmv = 1.0 exactly.
-#        Eliminates the clamp hack and tightens the loss landscape.
-#        Auto-disabled when spatial_on=False (DNN mode) because all
-#        three heads see identical z_ivim — softmax degenerates.
-#
-#     Set False for legacy R0-R20 behavior.
 #
 #   GRADIENT FLOW (fully separated):
 #     IVIM MSE  → physics heads → z_X → (1-g)*z_ivim → IVIM encoder
@@ -569,9 +543,6 @@ class ConcatFusion(nn.Module):
     Matches nn.MultiheadAttention's call signature so Net.forward()
     requires no changes.
 
-    Used by R33 (ConcatFusion ablation) to test whether the QKV
-    attention mechanism contributes beyond naive feature concatenation.
-
     Input:  query (B, 1, D), key/value (B, N_mod, D)
     Output: (B, 1, D), None
     """
@@ -628,17 +599,6 @@ class Net(nn.Module):
     Query is built from z_ivim + learned tissue token τ.
     Per-parameter gating (eq 5): z_X = (1-σ(g_X))·z_ivim + σ(g_X)·z_fused.
     Y-branch: separate projections for recon and tissue classification.
-
-    R21 additions:
-      use_ordered_diffusion=True  → cumulative softplus: Dpar < Dint < Dmv
-      use_softmax_fractions=True  → softmax simplex: Fpar + Fint + Fmv = 1
-        (auto-disabled when spatial_on=False)
-    Both default ON. Set False for legacy R0-R20 behavior.
-
-    R33 addition:
-      fusion_mode="concat"  → replaces cross-attention with ConcatFusion
-        (concat + MLP). Tests whether QKV attention contributes beyond
-        naive concatenation. Default "attention" preserves existing behavior.
     """
 
     def __init__(self, bvals, net_pars, patch_size=3, cnn_channels=2,
