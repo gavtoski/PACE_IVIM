@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pace.train_models.py
+# pace.learn_ivim.py
 # Bin Hoang | University of Rochester | Feb 2026
 # Training for Tissue Token IVIM — Per-Parameter Gating + Y-Branch.
 #
