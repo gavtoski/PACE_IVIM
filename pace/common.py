@@ -1,6 +1,9 @@
 """Shared helpers for the PACE synthetic evaluation.
 
-This module carries everything the figure scripts need to generate the figure in the manuscript. 
+This module carries everything the figure scripts need and nothing they do
+not. It has no dependency on torch or on the network definition, so the
+figures can be reproduced from the committed results without a GPU or a
+deep learning stack.
 
 Layout:
     1. Paths            repository layout, from configs/paths.yaml
@@ -13,15 +16,13 @@ Layout:
     8. Frames           the three analysis DataFrames
     9. Plotting         MRM figure formatting
 
-Metric note: Signal RMSE and parameter RMSE aggregate differently, and
+Metric note. Signal RMSE and parameter RMSE aggregate differently, and
 this is deliberate rather than an inconsistency. Signal RMSE has an inner
 axis to collapse, the b-values, so it takes the square root per voxel and
 then averages over voxels. Parameter RMSE has no inner axis, so it pools
 over voxels before taking the square root. Both formulas are carried here
 unchanged from the original analysis; they are given distinct names so the
 two can never be confused for one another.
-
-This script was patched together using 3 previous plotting scripts. Excues the mess.
 """
 
 from __future__ import annotations
@@ -474,8 +475,35 @@ def build_net(checkpoint: "Checkpoint", bvals, device=None):
     ).to(dev)
 
 
+def _find_checkpoint(root: Path, ck: "Checkpoint") -> Path:
+    """Locate one checkpoint under an alternative directory.
+
+    The release stores weights flat, one .pt per public name. Training
+    writes a directory per run containing a .pt whose filename carries the
+    legacy tag. Both layouts are searched so either can be evaluated.
+    """
+    flat = root / f"{ck.public_name}.pt"
+    if flat.is_file():
+        return flat
+
+    run_dir = root / ck.public_name
+    if run_dir.is_dir():
+        hits = sorted(run_dir.glob("*.pt"))
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise ValueError(
+                f"{run_dir} contains {len(hits)} .pt files, so which one to "
+                f"load is ambiguous: {[h.name for h in hits]}")
+
+    raise FileNotFoundError(
+        f"no checkpoint for {ck.public_name} under {root}. Looked for "
+        f"{flat.name} and {ck.public_name}/*.pt")
+
+
 def load_net(model: str, snr: int, seed: int, bvals=None, device=None,
-             paths: Paths | None = None, strict: bool = True):
+             paths: Paths | None = None, strict: bool = True,
+             checkpoint_dir=None):
     """Build a Net and load its trained weights. Returns (net, checkpoint).
 
     Strict by default. The original inference code used strict=False, which
@@ -483,6 +511,16 @@ def load_net(model: str, snr: int, seed: int, bvals=None, device=None,
     checkpoint trained with it and silently discard Fpar_head, giving
     independent sigmoid fractions instead of a simplex. That produces
     plausible numbers and no error. Strict loading turns it into a crash.
+
+    checkpoint_dir overrides where the weights are read from, while the
+    architecture still comes from the manifest. This is what lets a
+    retrained network be evaluated against the released one: the two are
+    built identically and differ only in their weights. Two layouts are
+    accepted, the flat one used by the release and the per run
+    subdirectory that training writes:
+
+        <dir>/<model>_snr<N>_seed<S>.pt
+        <dir>/<model>_snr<N>_seed<S>/*.pt
     """
     import torch
 
@@ -493,7 +531,11 @@ def load_net(model: str, snr: int, seed: int, bvals=None, device=None,
     if bvals is None:
         bvals = load_bvals(p)
 
-    path = ck.path(p)
+    if checkpoint_dir is None:
+        path = ck.path(p)
+    else:
+        path = _find_checkpoint(Path(checkpoint_dir), ck)
+
     if not path.is_file():
         raise FileNotFoundError(f"checkpoint not found: {path}")
 

@@ -134,62 +134,52 @@ class InMemoryIVIMDataset:
         pass
 
 
-def _tissue_key(model):
-    return "Tissue"
+def _reject_if_inside(out_root, protected, label):
+    """Refuse an output path that is the protected tree or sits inside it.
+
+    Comparing for equality alone is not enough: a subdirectory such as
+    checkpoints/synthetic/logs would pass an equality test and still
+    overwrite released material. is_relative_to catches both cases, and
+    resolve() first normalises traversal, trailing slashes and absolute
+    paths so they cannot be used to slip past.
+    """
+    a, b = out_root.resolve(), protected.resolve()
+    if a == b or a.is_relative_to(b):
+        print(f"[ERROR] refusing to write to {a}, which is inside "
+              f"{label}. That directory holds released material. "
+              f"Choose another --out.", file=sys.stderr)
+        return True
+    return False
 
 
-def run_one(ck, paths, device, batch_size, out_root, overwrite, quiet=False):
-    """Run one checkpoint over the test set and write an H5. Returns a dict."""
-    import h5py
+
+def _forward_pass(net, loader, cfg, bvals, dev, ck, n_batches, quiet):
+    """Run every batch through the network. No gradients are computed.
+
+    Returns (predictions, tissue, lesion, valid_masks, seconds). The first
+    four are lists of per batch arrays. Noise is injected here, seeded once
+    by the caller, which is why the surviving voxel set depends on the
+    compute backend.
+    """
     import torch
-    from torch.utils.data import DataLoader
     from pace.deep_models import clean_ivim_signals
-
-    out_dir = out_root / f"{ck.model}_snr{ck.snr_db}"
-    out_path = out_dir / f"inferred_seed{ck.seed}.h5"
-    if out_path.is_file() and not overwrite:
-        if not quiet:
-            print(f"  [skip] exists: {out_path.name}")
-        return None
-
-    cfg = C.ARCH_CONFIGS[ck.cfg_name]
-    bvals = C.load_bvals(paths)
-    dev = C.resolve_device(device)
-
-    net, _ = C.load_net(ck.model, ck.snr_db, ck.seed, bvals=bvals,
-                        device=device, paths=paths, strict=True)
-
-    ds = InMemoryIVIMDataset(str(paths.synthetic_test),
-                             use_struct=cfg["use_struct"],
-                             use_b0=cfg["use_b0"])
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                        num_workers=0, drop_last=False)
-    n_batches = len(loader)
-    if not quiet:
-        print(f"  {len(ds):,} voxels in {n_batches} batches on {dev}",
-              flush=True)
 
     preds = {k: [] for k in PRED_KEYS}
     tissue, lesion, valid_chunks = [], [], []
 
-    # The noise is part of the experiment, so the seed matches the training
-    # seed of this checkpoint, exactly as the analysis did.
+    # Seed immediately before the loop. The noise injected below is the
+    # only consumer of the random stream here, so seeding at this point
+    # makes a repeated run on the same machine reproduce exactly. The seed
+    # matches the one this checkpoint was trained with, as the original
+    # analysis did.
     torch.manual_seed(ck.seed)
 
     t0 = time.time()
+
     with torch.no_grad():
         for bi, batch in enumerate(loader):
-            # The first batch on Metal includes a kernel compile, so it can
-            # take far longer than the rest. Report it separately rather than
-            # letting the run look stalled.
-            if not quiet and (bi == 0 or (bi + 1) % 10 == 0
-                              or bi + 1 == n_batches):
-                done_frac = (bi + 1) / n_batches
-                el = time.time() - t0
-                eta = el / max(done_frac, 1e-9) - el
-                print(f"\r    batch {bi + 1}/{n_batches}  "
-                      f"{el:5.1f}s elapsed, {eta:5.1f}s remaining",
-                      end="", flush=True)
+            _report_progress(bi, n_batches, t0, quiet)
+
             SP_in = (batch["struct_patch"].to(dev)
                      if cfg["spatial_on"] and cfg["use_struct"] else None)
             B0_in = (batch["b0_patch"].to(dev)
@@ -223,20 +213,79 @@ def run_one(ck, paths, device, batch_size, out_root, overwrite, quiet=False):
             tissue.append(batch["tissue"].numpy()[vm_np])
             lesion.append(batch["lesion"].numpy()[vm_np])
 
-    ds.close()
-    elapsed = time.time() - t0
     if not quiet:
         print(flush=True)
+    return preds, tissue, lesion, valid_chunks, time.time() - t0
 
-    global_valid = np.concatenate(valid_chunks)
+
+def _report_progress(bi, n_batches, t0, quiet):
+    """Progress line. The first batch on Metal includes a kernel compile,
+    so it can take far longer than the rest."""
+    if quiet or not (bi == 0 or (bi + 1) % 10 == 0 or bi + 1 == n_batches):
+        return
+    done = (bi + 1) / n_batches
+    el = time.time() - t0
+    print(f"\r    batch {bi + 1}/{n_batches}  {el:5.1f}s elapsed, "
+          f"{el / max(done, 1e-9) - el:5.1f}s remaining", end="", flush=True)
+
+
+def _assemble(preds, tissue, lesion, valid_chunks, bvals):
+    """Concatenate the per batch arrays into the output dictionary.
+
+    Valid_mask spans every input voxel, so it is deliberately longer than
+    the prediction arrays, which cover only the voxels that survived.
+    """
     save = {k: np.concatenate(v) for k, v in preds.items() if v}
     save["Tissue"] = np.concatenate(tissue)
     save["Lesion"] = np.concatenate(lesion)
-    save["Valid_mask"] = global_valid.astype(np.uint8)
+    save["Valid_mask"] = np.concatenate(valid_chunks).astype(np.uint8)
     save["bvals"] = np.asarray(bvals, dtype=np.float32)
+    return save
 
+
+def run_one(ck, paths, device, batch_size, out_root, overwrite,
+            quiet=False, checkpoint_dir=None):
+    """Run one checkpoint over the test set and write an H5. Returns a dict."""
+    import h5py
+    import torch
+    from torch.utils.data import DataLoader
+    from pace.deep_models import clean_ivim_signals
+
+    out_dir = out_root / f"{ck.model}_snr{ck.snr_db}"
+    out_path = out_dir / f"inferred_seed{ck.seed}.h5"
+    if out_path.is_file() and not overwrite:
+        if not quiet:
+            print(f"  [skip] exists: {out_path.name}")
+        return None
+
+    cfg = C.ARCH_CONFIGS[ck.cfg_name]
+    bvals = C.load_bvals(paths)
+    dev = C.resolve_device(device)
+
+    net, _ = C.load_net(ck.model, ck.snr_db, ck.seed, bvals=bvals,
+                        device=device, paths=paths, strict=True,
+                        checkpoint_dir=checkpoint_dir)
+
+    ds = InMemoryIVIMDataset(str(paths.synthetic_test),
+                             use_struct=cfg["use_struct"],
+                             use_b0=cfg["use_b0"])
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                        num_workers=0, drop_last=False)
+    n_batches = len(loader)
+    if not quiet:
+        print(f"  {len(ds):,} voxels in {n_batches} batches on {dev}",
+              flush=True)
+
+    preds, tissue, lesion, valid_chunks, elapsed = _forward_pass(
+        net, loader, cfg, bvals, dev, ck, n_batches, quiet)
+
+    ds.close()
+    if not quiet:
+        print(flush=True)
+
+    save = _assemble(preds, tissue, lesion, valid_chunks, bvals)
     n_kept = len(save["Dpar_pred"])
-    n_total = len(global_valid)
+    n_total = len(save["Valid_mask"])
 
     lengths = {len(v) for k, v in save.items() if k not in ("bvals",)}
     lengths.discard(n_total)  # Valid_mask is full length by design
@@ -295,6 +344,73 @@ def compare(ck, paths, out_root):
     return rows
 
 
+def preflight(args, paths, manifest):
+    """Validate the request. Returns (out_root, checkpoints) or (_, None)."""
+    out_root = Path(args.out)
+    if not out_root.is_absolute():
+        out_root = paths.repo_root / out_root
+
+    for protected, label in [(paths.results_dir, "results/synthetic"),
+                             (paths.checkpoints_dir, "checkpoints/synthetic")]:
+        if _reject_if_inside(out_root, protected, label):
+            return out_root, None
+
+    todo = [ck for ck in manifest.checkpoints
+            if (args.models is None or ck.model in args.models)
+            and (args.snrs is None or ck.snr_db in args.snrs)
+            and (args.seeds is None or ck.seed in args.seeds)]
+    if not todo:
+        print("[ERROR] no checkpoints match the selection.", file=sys.stderr)
+        print(f"        models {manifest.neural_models}", file=sys.stderr)
+        print(f"        SNR    {manifest.snrs()}", file=sys.stderr)
+        return out_root, None
+
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        print("[ERROR] torch is required. pip install torch", file=sys.stderr)
+        return out_root, None
+
+    return out_root, todo
+
+
+def print_comparison(todo, paths, out_root, weights_note=None):
+    """Report the regenerated output against the committed reference."""
+    print()
+    print("=" * 72)
+    print(" Regenerated against the committed reference")
+    print("=" * 72)
+    if weights_note:
+        print(f" Weights: {weights_note}")
+        print(" These are different weights to the ones that produced the")
+        print(" reference, so this compares two trained networks, not two")
+        print(" runs of the same one.")
+        print()
+    print(" Voxel level equality is not expected. Rician noise is injected")
+    print(" at inference and the random stream depends on the backend, so")
+    print(" the two runs retain different voxels and see different noise.")
+    print(" Close agreement in the means is the meaningful check.")
+    print()
+
+    worst = 0.0
+    for ck in todo:
+        rows = compare(ck, paths, out_root)
+        if not rows:
+            continue
+        print(f" {ck.public_name}")
+        print(f"   {'param':<6} {'reference':>12} {'regenerated':>12} "
+              f"{'rel diff':>10} {'n ref':>8} {'n new':>8}")
+        for r in rows:
+            worst = max(worst, r["rel_diff"])
+            print(f"   {r['param']:<6} {r['ref_mean']:>12.6g} "
+                  f"{r['new_mean']:>12.6g} {r['rel_diff']:>9.2%} "
+                  f"{r['ref_n']:>8,} {r['new_n']:>8,}")
+        print()
+
+    print(f" largest relative difference in any mean: {worst:.2%}")
+    print("=" * 72)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Reproduce the synthetic inference results from the released checkpoints.")
@@ -308,6 +424,10 @@ def main():
     ap.add_argument("--out", default="results/synthetic_regenerated",
                     help="Output directory, relative to the repository root.")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--checkpoints", default=None,
+                    help="Read weights from this directory instead of the "
+                         "released ones. The architecture still comes from "
+                         "the manifest, so the two differ only in weights.")
     ap.add_argument("--compare", action="store_true",
                     help="Compare against results/synthetic afterwards.")
     args = ap.parse_args()
@@ -315,33 +435,13 @@ def main():
     paths = C.load_paths()
     manifest = C.load_manifest(paths)
 
-    out_root = Path(args.out)
-    if not out_root.is_absolute():
-        out_root = paths.repo_root / out_root
-
-    if out_root.resolve() == paths.results_dir.resolve():
-        print("[ERROR] refusing to write into results/synthetic, which holds "
-              "the committed reference. Choose another --out.", file=sys.stderr)
-        return 2
-
-    todo = [ck for ck in manifest.checkpoints
-            if (args.models is None or ck.model in args.models)
-            and (args.snrs is None or ck.snr_db in args.snrs)
-            and (args.seeds is None or ck.seed in args.seeds)]
-    if not todo:
-        print("[ERROR] no checkpoints match the selection.", file=sys.stderr)
-        print(f"        models {manifest.neural_models}", file=sys.stderr)
-        print(f"        SNR    {manifest.snrs()}", file=sys.stderr)
-        return 2
-
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        print("[ERROR] torch is required. pip install torch", file=sys.stderr)
+    out_root, todo = preflight(args, paths, manifest)
+    if todo is None:
         return 2
 
     dev = C.resolve_device(args.device)
     print(f"[DATA  ] {paths.synthetic_test.name}")
+    print(f"[WEIGHT] {args.checkpoints or 'checkpoints/synthetic (released)'}")
     print(f"[DEVICE] {dev}")
     print(f"[OUT   ] {out_root.relative_to(paths.repo_root)}")
     print(f"[RUN   ] {len(todo)} checkpoint(s)")
@@ -355,7 +455,7 @@ def main():
               f"softmax={ck.use_softmax_fractions}")
         try:
             r = run_one(ck, paths, args.device, args.batch_size, out_root,
-                        args.overwrite)
+                        args.overwrite, checkpoint_dir=args.checkpoints)
             if r:
                 done.append(r)
         except Exception as e:
@@ -368,31 +468,7 @@ def main():
         print(f"   {name}: {err}")
 
     if args.compare:
-        print()
-        print("=" * 72)
-        print(" Regenerated against the committed reference")
-        print("=" * 72)
-        print(" Voxel level equality is not expected. Rician noise is injected")
-        print(" at inference and the random stream depends on the backend, so")
-        print(" the two runs retain different voxels and see different noise.")
-        print(" Close agreement in the means is the meaningful check.")
-        print()
-        worst = 0.0
-        for ck in todo:
-            rows = compare(ck, paths, out_root)
-            if not rows:
-                continue
-            print(f" {ck.public_name}")
-            print(f"   {'param':<6} {'reference':>12} {'regenerated':>12} "
-                  f"{'rel diff':>10} {'n ref':>8} {'n new':>8}")
-            for r in rows:
-                worst = max(worst, r["rel_diff"])
-                print(f"   {r['param']:<6} {r['ref_mean']:>12.6g} "
-                      f"{r['new_mean']:>12.6g} {r['rel_diff']:>9.2%} "
-                      f"{r['ref_n']:>8,} {r['new_n']:>8,}")
-            print()
-        print(f" largest relative difference in any mean: {worst:.2%}")
-        print("=" * 72)
+        print_comparison(todo, paths, out_root, args.checkpoints)
 
     print()
     return 1 if failed else 0

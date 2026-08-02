@@ -60,23 +60,8 @@ def learn_IVIM(
     early_stop_start=None,
     # --- Legacy compat ---
     freeze_perf_gate=False,
-    # --- Device selection ---
-    device=None,
 ):
-    # Device selection. Passing device explicitly overrides the search.
-    # The order below prefers a discrete GPU, then Apple Silicon's Metal
-    # backend, then the CPU. Metal was not an option when this function
-    # was written, so an unpatched copy falls through to CPU on a Mac.
-    if device is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif getattr(torch.backends, "mps", None) and \
-                torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-    device = str(device)
-
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
 

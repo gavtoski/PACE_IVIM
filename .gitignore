@@ -46,3 +46,5 @@ venv/
 .idea/
 results/synthetic_regenerated/
 tools/
+data/synthetic/synthetic_IVIM_train_2D.h5
+checkpoints/synthetic_retrained/
