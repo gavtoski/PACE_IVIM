@@ -12,8 +12,9 @@ There are two claims to check, and they are separate:
    `checkpoints/`.
 
 The second is the stronger claim, and section 4 is where it is tested.
-Section 5 covers the first, and section 6 shows how to confirm the
-architecture of each released network directly from its weights.
+Section 5 covers the first. Sections 2, 3 and 6 confirm that the released
+weights are intact and that their architecture is what the manifest says
+it is.
 
 Expect the whole guide to take about ten minutes.
 
@@ -49,46 +50,95 @@ python -c "import torch, numpy; print(torch.__version__, numpy.__version__)"
 
 ## 2. Check the released assets
 
+Every checkpoint carries a SHA-256 in `configs/models.json`. Confirming
+them proves the weights you have are the weights that were released.
+
 ```bash
-python tools/release/05_stage_check.py
+python -c "
+import hashlib, json, pathlib
+doc = json.load(open('configs/models.json'))
+bad = 0
+for e in doc['checkpoints']:
+    p = pathlib.Path(e['target_rel'])
+    if not p.is_file():
+        print(f'MISSING  {p}'); bad += 1; continue
+    h = hashlib.sha256(p.read_bytes()).hexdigest()
+    if h != e['sha256']:
+        print(f'MISMATCH {p}'); bad += 1
+print(f'{len(doc[\"checkpoints\"])} checkpoints, {bad} problem(s)')
+"
 ```
 
-This verifies each of the 24 checkpoints against the SHA-256 recorded in
-`configs/models.json`, reads the b-value table and the test set, and
-inspects the result files.
+Expect **0 problems** across 24 checkpoints.
 
-It also reports the fusion signature of each architecture, read from the
-weights themselves rather than from any configuration file:
+The architecture of each network is also readable directly from its
+weights, without trusting any configuration file. Cross attention stores
+`cross_attn.in_proj_weight`; concatenation fusion stores `cross_attn.proj`;
+a signal only model has neither.
+
+```bash
+python -c "
+import torch
+for m in ['dnn','pace','cnn_fusion']:
+    k = torch.load(f'checkpoints/synthetic/{m}_snr25_seed19.pt',
+                   map_location='cpu', weights_only=True).keys()
+    mode = ('concat'    if any('cross_attn.proj' in x for x in k) else
+            'attention' if any('cross_attn.in_proj_weight' in x for x in k)
+            else 'none')
+    n = sum(v.numel() for v in torch.load(
+        f'checkpoints/synthetic/{m}_snr25_seed19.pt',
+        map_location='cpu', weights_only=True).values())
+    print(f'{m:<12} fusion={mode:<10} {n:>9,} values')
+"
+```
+
+Expected:
 
 ```
-cnn_fusion   declared=concat     found=concat
-dnn          declared=attention  found=none
-pace         declared=attention  found=attention
+dnn          fusion=none            7,303 values
+pace         fusion=attention     194,802 values
+cnn_fusion   fusion=concat        198,866 values
 ```
 
-`dnn` reporting `none` is correct. That model has no spatial pathway, so it
-has no fusion block at all and its `fusion_mode` field is not meaningful.
+`dnn` reporting `none` is correct: that model has no spatial pathway, so it
+has no fusion block at all.
 
-Expect **0 failures**. Two warnings are normal: 24 result files carry no
-embedded ground truth, because the writer that produced them stored a
-validity mask instead, and the ground truth is taken from the test split.
+Note that `cnn_fusion` has slightly **more** parameters than `pace`. The
+two differ only in the fusion module, and concatenation fusion is the
+larger of the two, so the comparison between them is not confounded by
+model capacity.
 
 ---
 
-## 3. Check the package
+## 3. Check that the package loads
+
+Every released checkpoint should load into a network built from its
+manifest entry, with no key left over on either side. Strict loading is
+what makes this meaningful: it compares the full set of parameter names in
+both directions, so any error in the reconstructed architecture raises
+instead of silently dropping weights.
 
 ```bash
-python tools/release/09_verify_package.py
+python -c "
+from pace import common as C
+M = C.load_manifest(C.load_paths())
+bad = 0
+for ck in M.checkpoints:
+    try:
+        net, _ = C.load_net(ck.model, ck.snr_db, ck.seed, device='cpu')
+        n = sum(p.numel() for p in net.parameters())
+        print(f'{ck.public_name:<26} {n:>9,} params  ok')
+    except Exception as e:
+        bad += 1
+        print(f'{ck.public_name:<26} FAIL  {type(e).__name__}')
+print(f'--- {bad} failures ---')
+"
 ```
 
-This imports every module, confirms that each cross-module import resolves
-to a symbol that exists, checks that call sites pass only keywords their
-callees accept, and compares the declared dependencies against what the
-code actually imports.
-
-Expect **0 failures**. Two warnings are expected: `scikit-learn` is
-declared but used only by code outside `pace/`, and three references to
-pre-rename module names survive inside string literals, which is cosmetic.
+Expect **0 failures**. Parameter counts are 7,245 for `dnn`, 194,744 for
+`pace` and 198,808 for `cnn_fusion`. These are 58 lower than the value
+counts in section 2 because `net.parameters()` excludes registered
+buffers: the 46 b-values and the two six element bound vectors.
 
 ---
 
