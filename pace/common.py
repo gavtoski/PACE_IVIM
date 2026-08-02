@@ -1,9 +1,6 @@
 """Shared helpers for the PACE synthetic evaluation.
 
-This module carries everything the figure scripts need and nothing they do
-not. It has no dependency on torch or on the network definition, so the
-figures can be reproduced from the committed results without a GPU or a
-deep learning stack.
+This module carries everything the figure scripts need to generate the figure in the manuscript. 
 
 Layout:
     1. Paths            repository layout, from configs/paths.yaml
@@ -16,13 +13,15 @@ Layout:
     8. Frames           the three analysis DataFrames
     9. Plotting         MRM figure formatting
 
-Metric note. Signal RMSE and parameter RMSE aggregate differently, and
+Metric note: Signal RMSE and parameter RMSE aggregate differently, and
 this is deliberate rather than an inconsistency. Signal RMSE has an inner
 axis to collapse, the b-values, so it takes the square root per voxel and
 then averages over voxels. Parameter RMSE has no inner axis, so it pools
 over voxels before taking the square root. Both formulas are carried here
 unchanged from the original analysis; they are given distinct names so the
 two can never be confused for one another.
+
+This script was patched together using 3 previous plotting scripts. Excues the mess.
 """
 
 from __future__ import annotations
