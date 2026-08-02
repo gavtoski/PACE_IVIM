@@ -32,8 +32,11 @@ into the next. **[VERIFY.md](VERIFY.md)** walks through confirming that the
 released checkpoints reproduce the reported numbers, in about ten minutes
 on a laptop.
 
-The complete repository will be released once the associated manuscript
-has been accepted.
+Although the manuscript is still under review, the synthetic evaluation is
+made available in full, including the trained weights and the code that
+produced them, so that the results can be checked rather than taken on
+trust. The in-vivo and brain map work follows once the manuscript is
+accepted.
 
 ## Models
 
@@ -122,9 +125,9 @@ python scripts/train_synthetic.py --models pace --snrs 25 --seeds 19 --dry-run
 python scripts/train_synthetic.py --models pace --snrs 25 --seeds 19 --compare
 ```
 
-Requires the training set, which is not distributed here. Uses CUDA, Metal
-or CPU, whichever is available. About 45 minutes per model on an Apple
-Silicon GPU.
+Requires the training set, which is attached to a release rather than
+committed; see Data availability below. Uses CUDA, Metal or CPU, whichever
+is available. About 45 minutes per model on an Apple Silicon GPU.
 
 Architecture and the identifiability flags come from `configs/models.json`,
 the same source inference reads, so a retrained network cannot differ in
@@ -149,9 +152,21 @@ spatial gates matched to three decimal places.
 ## Data availability
 
 The synthetic dataset, trained weights and inference outputs required to
-reproduce every figure in this repository are included here. The synthetic
-training set is not: it is needed only to retrain from scratch, and is
-available from the authors on request.
+reproduce every figure in this repository are included here.
+
+The synthetic training set is not, because it exceeds the file size limit
+for a repository. It is needed only to retrain from scratch, not to
+reproduce any result described here, and is attached to a release:
+
+  https://github.com/gavtoski/PACE_IVIM/releases/tag/v0.1-data
+
+```bash
+gh release download v0.1-data --dir data/synthetic
+shasum -a 256 data/synthetic/synthetic_IVIM_train_2D.h5
+# cb76742f96643654def70c2dbdf2b5c33cc24f2cfa2338e263f883caaea2ef70
+```
+
+570,000 voxels, 46 b-values, 136 MB.
 
 The in-vivo NeuroCovid cohort cannot be shared. It is protected health
 information under an institutional review board protocol that does not
