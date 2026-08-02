@@ -40,6 +40,7 @@ import numpy as np
 __all__ = [
     "Paths", "load_paths", "find_repo_root",
     "Checkpoint", "Manifest", "load_manifest",
+    "ARCH_CONFIGS", "build_net", "load_net", "resolve_device",
     "MODEL_COLORS", "MODEL_LABELS", "MODEL_ORDER", "CONVENTIONAL_MODELS",
     "style_of", "color_of", "label_of", "ordered_models",
     "marker_of", "marker_size_of", "linestyle_of", "clean_spines",
@@ -185,7 +186,17 @@ def load_paths(config_path=None, repo_root=None) -> Paths:
 
 @dataclass(frozen=True)
 class Checkpoint:
-    """One trained network, as recorded in configs/models.json."""
+    """One trained network, as recorded in configs/models.json.
+
+    The three architecture flags below are recorded per checkpoint rather
+    than derived at run time. In the original analysis they were set from
+    three separate places: a dictionary literal, a spread operator, and a
+    patch applied roughly 2600 lines after the declaration. A config that
+    missed one silently fell back to a default, and because these flags
+    change activations rather than parameter shapes, the resulting network
+    still loaded a checkpoint without error and returned wrong numbers.
+    Recording them here makes a missing value raise instead.
+    """
     public_name: str
     model: str
     legacy_tag: str
@@ -194,6 +205,8 @@ class Checkpoint:
     snr_db: int
     seed: int
     target_rel: str
+    use_ordered_diffusion: bool | None = None
+    use_softmax_fractions: bool | None = None
     sha256: str = ""
     size_bytes: int = 0
 
@@ -227,6 +240,8 @@ class Manifest:
                 snr_db=int(e["snr_db"]),
                 seed=int(e["seed"]),
                 target_rel=e["target_rel"],
+                use_ordered_diffusion=e.get("use_ordered_diffusion"),
+                use_softmax_fractions=e.get("use_softmax_fractions"),
                 sha256=e.get("sha256") or "",
                 size_bytes=int(e.get("size_bytes", 0)),
             ))
@@ -321,7 +336,206 @@ def load_manifest(paths: Paths | None = None) -> Manifest:
 
 
 # ===========================================================
-# 3. Styles
+# 3. Network construction
+# ===========================================================
+
+# Architecture parameters per model, excluding the three flags that are
+# recorded per checkpoint in the manifest. Keys are the cfg_name values
+# stored in configs/models.json, which are the original analysis tags.
+#
+# These are the arguments Net.__init__ accepts. Anything absent here takes
+# the Net default, matching how the analysis constructed its networks.
+ARCH_CONFIGS = {
+    # Signal only baseline. No spatial pathway at all, so the anatomical
+    # token, structural and b0 inputs, and both dropout terms are off.
+    "R13_LongDNN": {
+        "spatial_on": False,
+        "use_struct": False,
+        "use_b0": False,
+        "parallel_heads": True,
+        "recon_struct": False,
+        "recon_b0": False,
+        "ivim_latent_dim": 32,
+        "latent_dropout_p": 0.0,
+        "modality_dropout_p": 0.0,
+        "detach_recon": False,
+        "detach_spatial_delta": True,
+        "use_anat_token": False,
+    },
+    # Cross attention fusion.
+    #
+    # recon_struct and recon_b0 are True here even though the analysis
+    # trained with alpha_recon=0, meaning the reconstruction loss was never
+    # applied. The training driver sets recon_all=False but leaves the two
+    # individual flags alone, and learn_IVIM defaults both to True, so the
+    # decoders were built and saved into every checkpoint. The inference
+    # configuration in the original notebook set them False and relied on
+    # load_state_dict(strict=False) to discard the extra weights. That was
+    # harmless, because the decoders are terminal: they consume the spatial
+    # token after the parameter heads have already produced their output and
+    # never feed back. Matching the trained architecture instead lets the
+    # checkpoint load strictly, so a genuine mismatch would be caught.
+    "R29_CE_ID": {
+        "spatial_on": True,
+        "use_struct": True,
+        "use_b0": True,
+        "parallel_heads": True,
+        "recon_struct": True,
+        "recon_b0": True,
+        "ivim_latent_dim": 32,
+        "latent_dropout_p": 0.3,
+        "modality_dropout_p": 0.15,
+        "detach_recon": False,
+        "detach_spatial_delta": True,
+        "use_anat_token": True,
+    },
+    # Concatenation fusion. Identical to R29_CE_ID apart from fusion_mode,
+    # which is recorded in the manifest, so the pair isolates the fusion
+    # module as the single architectural variable.
+    "R36_ConcatSoftmax": {
+        "spatial_on": True,
+        "use_struct": True,
+        "use_b0": True,
+        "parallel_heads": True,
+        "recon_struct": True,
+        "recon_b0": True,
+        "ivim_latent_dim": 32,
+        "latent_dropout_p": 0.3,
+        "modality_dropout_p": 0.15,
+        "detach_recon": False,
+        "detach_spatial_delta": True,
+        "use_anat_token": True,
+    },
+}
+
+
+def resolve_device(device=None):
+    """Pick a compute device, preferring the accelerator that is present."""
+    import torch
+    if device and device != "auto":
+        return torch.device(device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def build_net(checkpoint: "Checkpoint", bvals, device=None):
+    """Construct an untrained Net matching one checkpoint's architecture.
+
+    Mirrors the Net(...) call inside learn_ivim.learn_IVIM exactly, so a
+    network built here is structurally identical to the one that produced
+    the weights. The three flags come from the manifest and are required;
+    a missing value raises rather than falling back to a default.
+    """
+    cfg = ARCH_CONFIGS.get(checkpoint.cfg_name)
+    if cfg is None:
+        raise KeyError(
+            f"no ARCH_CONFIGS entry for cfg_name={checkpoint.cfg_name!r} "
+            f"(model {checkpoint.model!r}). Known: {sorted(ARCH_CONFIGS)}")
+
+    for flag in ("use_ordered_diffusion", "use_softmax_fractions"):
+        if getattr(checkpoint, flag) is None:
+            raise ValueError(
+                f"{checkpoint.public_name} has no {flag} in configs/models.json. "
+                f"These flags change the output activation without changing "
+                f"any parameter shape, so guessing one would load the weights "
+                f"successfully and return wrong values. Add them to the "
+                f"manifest.")
+
+    from pace.deep_models import Net
+    from pace.hyperparams import net_pars
+
+    dev = resolve_device(device)
+
+    npars = net_pars()
+    npars.use_three_compartment = True
+    npars.fitS0 = True
+    npars.device = dev
+
+    return Net(
+        bvals=bvals, net_pars=npars, patch_size=3,
+        spatial_on=cfg["spatial_on"],
+        parallel_heads=cfg["parallel_heads"],
+        recon_struct=cfg["recon_struct"],
+        recon_b0=cfg["recon_b0"],
+        use_struct=cfg["use_struct"],
+        use_b0=cfg["use_b0"],
+        ivim_latent_dim=cfg["ivim_latent_dim"],
+        latent_dropout_p=cfg["latent_dropout_p"],
+        modality_dropout_p=cfg["modality_dropout_p"],
+        detach_recon=cfg.get("detach_recon", False),
+        detach_spatial_delta=cfg.get("detach_spatial_delta", True),
+        use_anat_token=cfg.get("use_anat_token", True),
+        gate_inits=cfg.get("gate_inits", None),
+        use_ordered_diffusion=checkpoint.use_ordered_diffusion,
+        use_softmax_fractions=checkpoint.use_softmax_fractions,
+        fusion_mode=checkpoint.fusion_mode,
+    ).to(dev)
+
+
+def load_net(model: str, snr: int, seed: int, bvals=None, device=None,
+             paths: Paths | None = None, strict: bool = True):
+    """Build a Net and load its trained weights. Returns (net, checkpoint).
+
+    Strict by default. The original inference code used strict=False, which
+    means a network built without the softmax simplex will happily load a
+    checkpoint trained with it and silently discard Fpar_head, giving
+    independent sigmoid fractions instead of a simplex. That produces
+    plausible numbers and no error. Strict loading turns it into a crash.
+    """
+    import torch
+
+    p = paths or load_paths()
+    manifest = load_manifest(p)
+    ck = manifest.checkpoint(model, snr, seed)
+
+    if bvals is None:
+        bvals = load_bvals(p)
+
+    path = ck.path(p)
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint not found: {path}")
+
+    net = build_net(ck, bvals, device)
+    state = torch.load(path, map_location=resolve_device(device),
+                       weights_only=True)
+    try:
+        net.load_state_dict(state, strict=strict)
+    except RuntimeError as e:
+        # Summarise by layer prefix rather than listing every tensor, so the
+        # message names the module that differs instead of scrolling.
+        have = set(state)
+        want = set(net.state_dict())
+
+        def prefixes(keys):
+            out = {}
+            for k in keys:
+                out[k.split(".")[0]] = out.get(k.split(".")[0], 0) + 1
+            return ", ".join(f"{k} ({n})" for k, n in sorted(out.items()))
+
+        extra, missing = have - want, want - have
+        detail = []
+        if extra:
+            detail.append(f"  in the checkpoint but not the built net: "
+                          f"{prefixes(extra)}")
+        if missing:
+            detail.append(f"  in the built net but not the checkpoint: "
+                          f"{prefixes(missing)}")
+        raise RuntimeError(
+            f"{ck.public_name} weights do not match the architecture built "
+            f"from cfg_name={ck.cfg_name!r}, fusion_mode={ck.fusion_mode!r}, "
+            f"ordered={ck.use_ordered_diffusion}, "
+            f"softmax={ck.use_softmax_fractions}.\n"
+            + "\n".join(detail) + f"\n{e}") from None
+
+    net.eval()
+    return net, ck
+
+
+# ===========================================================
+# 4. Styles
 # ===========================================================
 
 # Colours preserved from the original analysis so published figures keep
@@ -427,7 +641,7 @@ def ordered_models(models) -> list[str]:
 
 
 # ===========================================================
-# 4. Tissue
+# 5. Tissue
 # ===========================================================
 
 TISSUE_COLORS = {
@@ -463,7 +677,7 @@ def decode_tissue_array(tissue_arr, lesion_arr) -> np.ndarray:
 
 
 # ===========================================================
-# 5. Physics
+# 6. Physics
 # ===========================================================
 
 PARAM_NAMES = ["Dpar", "Dint", "Dmv", "Fint", "Fmv", "S0"]
@@ -521,7 +735,7 @@ def reconstruct_signal(params: dict, bvals) -> np.ndarray:
 
 
 # ===========================================================
-# 6. Metrics
+# 7. Metrics
 # ===========================================================
 
 def signal_rmse_per_voxel(pred, ref) -> np.ndarray:
@@ -629,7 +843,7 @@ def boundary_mask(params: dict) -> np.ndarray:
 
 
 # ===========================================================
-# 7. Result I/O
+# 8. Result I/O
 # ===========================================================
 
 _RESULT_DIR_RE = re.compile(r"^(?P<model>.+)_snr(?P<snr>\d+)$")
@@ -891,7 +1105,7 @@ def result_schema_report(paths: Paths | None = None) -> dict:
 
 
 # ===========================================================
-# 8. Frames
+# 9. Frames
 # ===========================================================
 
 def _iter_results(models=None, snrs=None, paths=None):
@@ -1019,7 +1233,7 @@ def build_cnr_df(models=None, snrs=None, pair=("WMH", "NAWM"),
 
 
 # ===========================================================
-# 9. Plotting
+# 10. Plotting
 # ===========================================================
 
 MRM_SINGLE_COL_MM = 84
