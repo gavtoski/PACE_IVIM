@@ -12,25 +12,6 @@ Bayesian MAP adapted from: Gurney-Champion / Barbieri (MRM 2021)
   beta for fractions) fitted from initial LSQ estimates, rather
   than fixed Gaussian priors centered on bounds midpoints.
 
-Modifications (March 2026):
-  - Standalone module (no global arg dependency)
-  - Bounds loaded dynamically from hyperparams_deep2.net_pars()
-  - Consistent output order: [Dpar, Fint, Dint, Fmv, Dmv, S0]
-  - All methods normalize internally + return absolute S0
-  - Diagnostic output: per-method fitting MSE + convergence stats
-  - B-value averaging (Voorter Trace-averaging equivalent)
-  - Multi-start LSQ: 3 random initializations, keep best MSE
-  - Fast MAP prior: raw numpy math instead of scipy.stats.pdf (~40x speedup)
-  - FIX (March 2026): When a compartment fraction is negligible (F<1e-4)
-    or the NNLS spectrum has no weight in a compartment, the corresponding
-    diffusivity is set to the midpoint of its bounds instead of NaN.
-  - FIX (March 11 2026): NaN-safe normalization via _safe_normalize().
-    Handles NaN/Inf/negative S0_init. Per-voxel NNLS try/except.
-    Invalid voxels masked to finite sentinels at output.
-  - FIX (March 12 2026): split_prior=True in MAP prevents double-dipping
-    where the empirical prior learns the answer from the same voxels it
-    regularizes. Prior is estimated from a random half; the other half is
-    MAP-fitted. Critical for fair synthetic benchmarks.
 
 requirements: numpy, scipy, tqdm, joblib, h5py
 """
