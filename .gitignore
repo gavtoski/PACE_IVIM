@@ -44,3 +44,4 @@ venv/
 # Editors
 .vscode/
 .idea/
+results/synthetic_regenerated/
