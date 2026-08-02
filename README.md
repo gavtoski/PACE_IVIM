@@ -15,13 +15,19 @@ tissue, interstitial fluid, and microvascular blood.
 
 PACE conditions parameter estimation on anatomical context by fusing the
 IVIM signal encoding with T1, FLAIR, and b=0 spatial tokens through
-cross attention, under a softmax simplex constraint on the compartment
+cross attention., under a softmax simplex constraint on the compartment
 fractions and a monotonic ordering constraint on the diffusion coefficients.
 
 ## Status
 
 This repository currently contains the **synthetic evaluation** only.
 The in-vivo code and the synthetic brain map experiments are not included.
+
+Everything needed to check the synthetic results is here: the trained
+weights, the test data, the inference outputs, and the code that turns one
+into the next. **[VERIFY.md](VERIFY.md)** walks through confirming that the
+released checkpoints reproduce the published numbers, in about ten minutes
+on a laptop.
 
 The complete repository will be released once the associated manuscript
 has been accepted.
@@ -56,20 +62,58 @@ figures/       generated figures
 
 ## Installation
 
+Python 3.10 or newer.
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
+pip install "numpy<2"
 cp configs/paths.example.yaml configs/paths.yaml
 ```
 
+The NumPy pin is required: current PyTorch wheels are built against
+NumPy 1.x and fail on conversion to arrays under NumPy 2.x.
+
 ## Usage
 
-TODO once the scripts land.
+Redraw every figure from the committed inference results. Needs neither a
+GPU nor PyTorch:
+
+```bash
+python scripts/make_manuscript_figures.py
+python scripts/make_manuscript_figures.py --figures 1 2.0
+python scripts/make_manuscript_figures.py --snrs 25 30 35
+```
+
+Six figures are produced: signal RMSE (1), per parameter RMSE as lines
+(2.0) and as bars (2.1), Bland Altman against ground truth (2.2), lesion
+CNR (3.1), and the learned spatial gate values (4.1).
+
+Re-run the trained networks over the test set and compare the output
+against the committed results:
+
+```bash
+python scripts/reproduce_synthetic_results.py --compare
+python scripts/reproduce_synthetic_results.py --models pace --snrs 25
+```
+
+The two form a chain:
+
+```
+checkpoints  ->  reproduce_synthetic_results.py  ->  results
+results      ->  make_manuscript_figures.py      ->  figures
+```
+
+See **[VERIFY.md](VERIFY.md)** for what agreement to expect and why the
+comparison is statistical rather than exact.
 
 ## Data availability
 
 The synthetic dataset, trained weights and inference outputs required to
-reproduce every figure in this repository are included here.
+reproduce every figure in this repository are included here. The synthetic
+training set is not: it is needed only to retrain from scratch, and is
+available from the authors on request.
 
 The in-vivo NeuroCovid cohort cannot be shared. It is protected health
 information under an institutional review board protocol that does not
@@ -147,8 +191,12 @@ Imaging*, 64(1), 2026.
 
 ## Citation
 
-TODO, pending acceptance.
+A citation will be added once the associated manuscript is published. Until
+then, please cite this repository by URL.
 
 ## License
 
-TODO
+MIT. See [LICENSE](LICENSE).
+
+`pace/conventional_models.py` derives from the IVIMNET project by
+Gurney-Champion and Kaandorp [2], which is also MIT licensed.

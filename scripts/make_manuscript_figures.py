@@ -8,9 +8,11 @@ Figures
 -------
 1    Signal fit quality      1x3: RMSE against SNR, ranked mean, residual
                              against b-value
+2.0  Parameter RMSE          2x3 line plots against SNR
 2.1  Parameter RMSE          2x3 bar grid, fixed model order
 2.2  Bland Altman            3x5, method against ground truth
 3.1  Lesion CNR              2x5, predicted CNR and CNR RMSE against SNR
+4.1  Spatial gating          2x2, learned sigma(g_X) from the training logs
 
 Conventions follow the analysis notebook: triangles with dashed
 connectors for the conventional fitters, circles with solid connectors
@@ -51,7 +53,28 @@ FS_TITLE_PAD = 10
 
 # Output resolution per figure, matching FIG1_DPI, FIG2_DPI, FIG22_DPI
 # and FIG3_DPI in the analysis. Figure 1 alone is saved at 600.
-DPI = {"fig1": 600, "fig2_1": 300, "fig2_2": 300, "fig3_1": 300}
+DPI = {"fig1": 600, "fig2_0": 300, "fig2_1": 300, "fig2_2": 300,
+       "fig3_1": 300, "fig4_1": 300}
+
+# Figure 2.0 font sizes.
+F20_SUPTITLE, F20_TITLE, F20_LABEL = 16, 15, 13
+F20_TICK, F20_LEGEND = 11, 12
+F20_LW_CONNECTOR = 1.8
+F20_MS_CONV, F20_MS_LEARNED = 8, 7
+
+# Figure 4.1, spatial gating. The two architectures share the per parameter
+# gating equation z_X = (1 - sigma(g_X)) z_ivim + sigma(g_X) z_fused and
+# differ only in the fusion module that produces z_fused.
+GATE_NAMES = ["Dpar", "Dint", "Dmv", "Fint", "Fmv", "S0"]
+GATE_LATEX = {
+    "Dpar": r"$D_{par}$", "Dint": r"$D_{int}$", "Dmv": r"$D_{mv}$",
+    "Fint": r"$F_{int}$", "Fmv": r"$F_{mv}$", "S0": r"$S_0$",
+}
+GATE_COLORS = {"Dpar": "#264653", "Dint": "#2a9d8f", "Dmv": "#e9c46a",
+               "Fint": "#f4a261", "Fmv": "#e76f51", "S0": "#6a4c93"}
+GATE_LS = {"Dpar": "-", "Dint": "-", "Dmv": "-",
+           "Fint": "--", "Fmv": "--", "S0": ":"}
+GATE_SNR = 25
 
 # Figure 2.2.
 BA_SNR, BA_SEED_INDEX = 25, 0
@@ -230,6 +253,215 @@ def figure1(df_sig, snrs, models, paths, show_residual=True):
         warnings.simplefilter("ignore", UserWarning)
         fig.tight_layout(rect=(0, 0.09, 1, 1))
     return fig, bars
+
+
+# ===========================================================
+# Figure 2.0
+# ===========================================================
+
+def _param_rmse_curve(df, model, param, snrs):
+    """Mean RMSE per SNR, pooling tissues and seeds in one operation.
+
+    Equivalent to pooling across GM, NAWM and WMH and then averaging over
+    seeds, which is how the original analysis aggregated this figure. Note
+    that Figure 2.1 aggregates differently, collapsing tissues within each
+    (SNR, seed) before averaging, so the two are not interchangeable.
+    """
+    xs, ys = [], []
+    for snr in snrs:
+        sub = df[(df.model == model) & (df.param == param) &
+                 (df.snr == snr)]["rmse"]
+        if sub.empty:
+            continue
+        xs.append(snr)
+        ys.append(float(sub.mean()))
+    return np.array(xs, dtype=float), np.array(ys)
+
+
+def figure20(df_par, snrs, models, include_s0=True, log_y=False):
+    top = ["Dpar", "Dint", "Fint"]
+    bottom = ["Dmv", "Fmv"] + (["S0"] if include_s0 else [])
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=False)
+
+    for r, plist in enumerate([top, bottom]):
+        for c in range(3):
+            ax = axes[r, c]
+            if c >= len(plist):
+                ax.set_visible(False)
+                # Hiding the lower subplot would strip the column's SNR
+                # axis, so restore it on the panel above.
+                if r == 1:
+                    upper = axes[0, c]
+                    plt.setp(upper.get_xticklabels(), visible=True)
+                    upper.set_xlabel("SNR (dB)", fontsize=F20_LABEL)
+                continue
+
+            p = plist[c]
+            for m in models:
+                xs, ys = _param_rmse_curve(df_par, m, p, snrs)
+                if len(xs) < 1:
+                    continue
+                col = C.color_of(m)
+                if len(xs) >= 2:
+                    ax.plot(xs, ys, color=col, linestyle=C.linestyle_of(m),
+                            lw=F20_LW_CONNECTOR, alpha=0.45, zorder=3)
+                ax.plot(xs, ys, marker=C.marker_of(m),
+                        markersize=(F20_MS_CONV if m in C.CONVENTIONAL_MODELS
+                                    else F20_MS_LEARNED),
+                        color=col, linestyle="None",
+                        label=C.label_of(m), zorder=5)
+
+            ax.set_title(C.PARAM_LATEX.get(p, p), fontsize=F20_TITLE,
+                         fontweight="bold")
+            if log_y:
+                ax.set_yscale("log")
+            else:
+                ax.set_ylim(bottom=0)
+            ax.set_xticks(sorted(snrs))
+            if c == 0:
+                ax.set_ylabel("Parameter RMSE", fontsize=F20_LABEL)
+            if r == 1:
+                ax.set_xlabel("SNR (dB)", fontsize=F20_LABEL)
+            ax.tick_params(axis="both", labelsize=F20_TICK)
+            C.clean_spines(ax)
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center",
+                   bbox_to_anchor=(0.5, 1.02), ncol=min(len(handles), 6),
+                   fontsize=F20_LEGEND, frameon=False)
+    fig.suptitle("Average IVIM Parameter RMSE vs Noise Level",
+                 fontsize=F20_SUPTITLE, fontweight="bold", y=1.06)
+    fig.tight_layout()
+    return fig
+
+
+# ===========================================================
+# Figure 4.1, spatial gating
+# ===========================================================
+
+def _load_gate_logs(model, snr, paths):
+    """Read sigma(g_X) trajectories from the shipped training logs.
+
+    Returns {seed: {gate_name: array over epochs}}. The logs live beside
+    the checkpoints under checkpoints/synthetic/logs, one directory per
+    checkpoint, so no additional data is required.
+    """
+    manifest = C.load_manifest(paths)
+    log_root = paths.checkpoints_dir / "logs"
+    out = {}
+    for ck in manifest.checkpoints:
+        if ck.model != model or ck.snr_db != snr:
+            continue
+        d = log_root / ck.public_name
+        if not d.is_dir():
+            continue
+        files = sorted(d.glob("log_*.npz"))
+        if not files:
+            continue
+        log = np.load(files[0])
+        gates = {g: log[f"gate_{g}"] for g in GATE_NAMES
+                 if f"gate_{g}" in log}
+        if gates:
+            out[ck.seed] = gates
+    return out
+
+
+def _gate_stats(logs):
+    """Final epoch mean and standard deviation across seeds, per gate."""
+    finals = {g: [] for g in GATE_NAMES}
+    for gates in logs.values():
+        for g in GATE_NAMES:
+            if g in gates:
+                finals[g].append(float(gates[g][-1]))
+    mean = {g: float(np.mean(v)) for g, v in finals.items() if v}
+    std = {g: float(np.std(v)) for g, v in finals.items() if v}
+    return mean, std
+
+
+def _gate_bar_panel(ax, mean, std, order, arch):
+    x = np.arange(len(order))
+    means = [mean[g] for g in order]
+    stds = [std[g] for g in order]
+    cmap = plt.cm.RdYlBu_r
+    ax.bar(x, means, yerr=stds, capsize=5, color=[cmap(m) for m in means],
+           edgecolor="k", linewidth=0.8, alpha=0.9, width=0.6)
+    ax.set_xticks(x)
+    ax.set_xticklabels([GATE_LATEX[g] for g in order], fontsize=13)
+    ax.set_ylabel(r"$\sigma(g_X)$", fontsize=14)
+    ax.set_ylim(-0.02, 1.02)
+    ax.axhline(0.5, color="gray", ls=":", alpha=0.4)
+    ax.axhline(0.0, color="black", lw=0.5, alpha=0.3)
+    ax.set_title(f"{arch}: Learned Spatial Gate Values", fontsize=13,
+                 fontweight="bold")
+    ax.grid(axis="y", alpha=0.2)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for i, (m, sd) in enumerate(zip(means, stds)):
+        ax.text(i, m + sd + 0.03, f"{m:.3f}", ha="center", va="bottom",
+                fontsize=10, fontweight="bold")
+
+
+def _gate_trajectory_panel(ax, logs, order, arch):
+    for g in order:
+        traj = [gates[g] for gates in logs.values() if g in gates]
+        if not traj:
+            continue
+        n = min(len(t) for t in traj)
+        mean_traj = np.stack([t[:n] for t in traj]).mean(axis=0)
+        ax.plot(np.arange(n), mean_traj, color=GATE_COLORS.get(g, "gray"),
+                ls=GATE_LS.get(g, "-"), lw=2.5, label=GATE_LATEX[g])
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel(r"$\sigma(g_X)$", fontsize=14)
+    ax.set_yscale("log")
+    ax.set_ylim(1e-3, 1.5)
+    ax.set_xlim(0, None)
+    ax.set_title(f"{arch}: Gate Evolution During Training", fontsize=13,
+                 fontweight="bold")
+    ax.legend(fontsize=14, loc="upper right", framealpha=0.15,
+              labelspacing=0.4, borderpad=0.4, handlelength=1.2,
+              handletextpad=0.4)
+    ax.grid(True, alpha=0.2)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
+def _gate_empty_row(ax_bar, ax_traj, arch, reason):
+    for ax in (ax_bar, ax_traj):
+        ax.text(0.5, 0.5, f"{arch}: {reason}", ha="center", va="center",
+                transform=ax.transAxes, fontsize=14, color="gray")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+
+
+def figure41(paths, snr=GATE_SNR):
+    """Spatial gating: PACE against CNN Fusion.
+
+    sigma(g_X) near 0 means parameter X ignores spatial context; near 1
+    means it relies on it. Read from the training logs, so this reflects
+    what the networks learned rather than anything recomputed here.
+    """
+    rows = [("pace", "PACE"), ("cnn_fusion", "CNN Fusion")]
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10),
+                             gridspec_kw={"width_ratios": [1, 1.8]})
+    summaries = []
+    for r, (model, arch) in enumerate(rows):
+        logs = _load_gate_logs(model, snr, paths)
+        if not logs:
+            _gate_empty_row(axes[r, 0], axes[r, 1], arch, "no gate logs found")
+            continue
+        mean, std = _gate_stats(logs)
+        order = [g for g in GATE_NAMES if g in mean]
+        _gate_bar_panel(axes[r, 0], mean, std, order, arch)
+        _gate_trajectory_panel(axes[r, 1], logs, order, arch)
+        summaries.append((arch, mean, std, order, len(logs)))
+
+    fig.suptitle(f"Spatial Gating Analysis: PACE vs CNN Fusion "
+                 f"(SNR={snr} dB)", fontsize=15, fontweight="bold", y=1.01)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    return fig, summaries
 
 
 # ===========================================================
@@ -480,8 +712,9 @@ def figure31(df_cnr, gt_cnr, params, snrs, models):
 
 def main():
     ap = argparse.ArgumentParser(description="Generate synthetic figures.")
-    ap.add_argument("--figures", nargs="+", default=["1", "2.1", "2.2", "3.1"],
-                    choices=["1", "2.1", "2.2", "3.1"])
+    ap.add_argument("--figures", nargs="+",
+                    default=["1", "2.0", "2.1", "2.2", "3.1", "4.1"],
+                    choices=["1", "2.0", "2.1", "2.2", "3.1", "4.1"])
     ap.add_argument("--snrs", nargs="+", type=int, default=None)
     ap.add_argument("--models", nargs="+", default=None)
     ap.add_argument("--format", nargs="+", default=["png", "pdf"])
@@ -513,7 +746,7 @@ def main():
     print(f"       SNR    {snrs}")
 
     need_sig = "1" in args.figures
-    need_par = "2.1" in args.figures
+    need_par = "2.1" in args.figures or "2.0" in args.figures
     need_cnr = "3.1" in args.figures
 
     print("[LOAD] building analysis frames")
@@ -534,6 +767,13 @@ def main():
                                show_residual=not args.no_residual)
         written += C.save_figure(fig, "fig1_signal_rmse", paths, args.format,
                                  dpi=DPI["fig1"])
+        plt.close(fig)
+
+    if "2.0" in args.figures:
+        print("[FIG ] fig2_0_param_rmse_vs_snr")
+        fig = figure20(df_par, snrs, order_par)
+        written += C.save_figure(fig, "fig2_0_param_rmse_vs_snr", paths,
+                                 args.format, dpi=DPI["fig2_0"])
         plt.close(fig)
 
     if "2.1" in args.figures:
@@ -557,6 +797,14 @@ def main():
         fig = figure31(df_cnr, gt_cnr, CNR_PARAMS, snrs, order_cnr)
         written += C.save_figure(fig, "fig3_1_cnr_rmse", paths, args.format,
                                  dpi=DPI["fig3_1"])
+        plt.close(fig)
+
+    gate_summaries = []
+    if "4.1" in args.figures:
+        print("[FIG ] fig4_1_spatial_gating")
+        fig, gate_summaries = figure41(paths)
+        written += C.save_figure(fig, "fig4_1_spatial_gating", paths,
+                                 args.format, dpi=DPI["fig4_1"])
         plt.close(fig)
 
     for w in written:
@@ -586,6 +834,28 @@ def main():
                 sd = f"\u00b1 {d['std']:.6f}" if d["n"] > 1 else "(1 seed)"
                 print(f"    {i}. {C.label_of(d['model']):>14s}  "
                       f"RMSE = {d['mean']:.6f} {sd}")
+
+    for arch, mean, std, order, n_seeds in gate_summaries:
+        print()
+        print(f"  Spatial gating, {arch} ({n_seeds} seed(s))")
+        print(f"  sigma(g) near 0 means signal only, near 1 means "
+              f"spatially driven")
+        print(f"  {'Param':<8} {'sigma(g) mean':>14} {'std':>8}  "
+              f"Interpretation")
+        print("  " + "." * 60)
+        for g in order:
+            m, sd = mean[g], std[g]
+            if m < 0.05:
+                interp = "pure signal (gate closed)"
+            elif m < 0.20:
+                interp = "mostly signal, slight spatial"
+            elif m < 0.50:
+                interp = "mixed signal and spatial"
+            elif m < 0.80:
+                interp = "mostly spatial"
+            else:
+                interp = "spatial dominated (gate open)"
+            print(f"  {g:<8} {m:14.4f} {sd:8.4f}  {interp}")
 
     print()
     return 0
