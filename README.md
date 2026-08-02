@@ -2,7 +2,7 @@
 
 **Prior-Informed Anatomical Context Encoding for 3-Compartment IVIM MRI**
 
-Reference implementation and synthetic evaluation for the PACE model, which
+Provides the implementation and synthetic evaluation for the PACE model, which
 fits a three component IVIM model to diffusion weighted brain MRI:
 
 ```
@@ -75,7 +75,7 @@ cp configs/paths.example.yaml configs/paths.yaml
 The NumPy pin is required: current PyTorch wheels are built against
 NumPy 1.x and fail on conversion to arrays under NumPy 2.x.
 
-## Usage
+## Test Usage
 
 Redraw every figure from the committed inference results. Needs neither a
 GPU nor PyTorch:
