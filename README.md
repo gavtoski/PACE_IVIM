@@ -15,7 +15,7 @@ tissue, interstitial fluid, and microvascular blood.
 
 PACE conditions parameter estimation on anatomical context by fusing the
 IVIM signal encoding with T1, FLAIR, and b=0 spatial tokens through
-cross attention., under a softmax simplex constraint on the compartment
+cross attention, under a softmax simplex constraint on the compartment
 fractions and a monotonic ordering constraint on the diffusion coefficients.
 
 ## Status
@@ -23,10 +23,13 @@ fractions and a monotonic ordering constraint on the diffusion coefficients.
 This repository currently contains the **synthetic evaluation** only.
 The in-vivo code and the synthetic brain map experiments are not included.
 
+**The associated manuscript is not yet published.** Nothing here has been
+peer reviewed, and the method may change before it is.
+
 Everything needed to check the synthetic results is here: the trained
 weights, the test data, the inference outputs, and the code that turns one
 into the next. **[VERIFY.md](VERIFY.md)** walks through confirming that the
-released checkpoints reproduce the published numbers, in about ten minutes
+released checkpoints reproduce the reported numbers, in about ten minutes
 on a laptop.
 
 The complete repository will be released once the associated manuscript
@@ -52,7 +55,8 @@ configuration and provenance.
 
 ```
 pace/          library code shared by the scripts
-scripts/       entry points
+scripts/       make_manuscript_figures, reproduce_synthetic_results,
+               train_synthetic
 configs/       model manifest and path configuration
 checkpoints/   trained weights
 data/          synthetic test and validation sets
@@ -107,6 +111,40 @@ results      ->  make_manuscript_figures.py      ->  figures
 
 See **[VERIFY.md](VERIFY.md)** for what agreement to expect and why the
 comparison is statistical rather than exact.
+
+## Retraining
+
+`scripts/train_synthetic.py` trains a network from scratch. It is the only
+script here that does; the other two load weights that already exist.
+
+```bash
+python scripts/train_synthetic.py --models pace --snrs 25 --seeds 19 --dry-run
+python scripts/train_synthetic.py --models pace --snrs 25 --seeds 19 --compare
+```
+
+Requires the training set, which is not distributed here. Uses CUDA, Metal
+or CPU, whichever is available. About 45 minutes per model on an Apple
+Silicon GPU.
+
+Architecture and the identifiability flags come from `configs/models.json`,
+the same source inference reads, so a retrained network cannot differ in
+configuration from the released one. `--compare` reports where training
+landed against the run that produced the released weights.
+
+To evaluate retrained weights instead of the released ones:
+
+```bash
+python scripts/reproduce_synthetic_results.py --models pace --snrs 25 --seeds 19 \
+    --checkpoints checkpoints/synthetic_retrained \
+    --out results/synthetic_from_retrained
+```
+
+Retraining does not reproduce the released weights exactly. Dropout,
+shuffling and noise injection draw from a random stream that differs by
+compute backend, and 35 epochs compound it. In our own check, twelve
+retrained configurations landed within roughly 20 percent of the released
+validation MSE, parameter RMSE agreed to within 8 percent, and the learned
+spatial gates matched to three decimal places.
 
 ## Data availability
 
