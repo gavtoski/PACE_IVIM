@@ -2,8 +2,8 @@
 
 **Prior-Informed Anatomical Context Encoding for 3-Compartment IVIM MRI**
 
-Provides reference's implementation and synthetic evaluation for the PACE model, which
-fits a three-component IVIM model to diffusion-weighted brain MRI:
+Reference implementation and synthetic evaluation for the PACE model, which
+fits a three component IVIM model to diffusion weighted brain MRI:
 
 ```
 S(b) = S0 * [ Fpar*exp(-b*Dpar) + Fint*exp(-b*Dint) + Fmv*exp(-b*Dmv) ]
@@ -15,13 +15,13 @@ tissue, interstitial fluid, and microvascular blood.
 
 PACE conditions parameter estimation on anatomical context by fusing the
 IVIM signal encoding with T1, FLAIR, and b=0 spatial tokens through
-cross-attention, under a softmax simplex constraint on the compartment
+cross attention., under a softmax simplex constraint on the compartment
 fractions and a monotonic ordering constraint on the diffusion coefficients.
 
 ## Status
 
 This repository currently contains the **synthetic evaluation** only.
-The in vivo code and the synthetic brain map experiments are not included.
+The in-vivo code and the synthetic brain map experiments are not included.
 
 Everything needed to check the synthetic results is here: the trained
 weights, the test data, the inference outputs, and the code that turns one
@@ -36,11 +36,11 @@ has been accepted.
 
 | Name | Description |
 |------|-------------|
-| `pace` | Cross-attention fusion with softmax simplex constraint |
+| `pace` | Cross attention fusion with softmax simplex constraint |
 | `cnn_fusion` | Concatenation fusion with softmax simplex constraint |
 | `dnn` | Signal only baseline, no spatial conditioning |
 | `lsq` | Two step least squares |
-| `nnls` | Non-negative least squares spectral decomposition |
+| `nnls` | Non negative least squares spectral decomposition |
 | `map` | Bayesian maximum a posteriori |
 
 The three neural models ship as trained weights under `checkpoints/synthetic/`.
