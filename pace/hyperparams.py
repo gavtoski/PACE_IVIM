@@ -1,8 +1,8 @@
-# ======================================================
+# ================================================================
 # Bin Hoang, University of Rochester
+# Set up boundary/hyperparameters based on Voorter's publication
 # pace.hyperparams.py
-# Fully self-contained version with hardcoded defaults
-# ======================================================
+# ================================================================
 
 import torch
 import os
@@ -110,7 +110,7 @@ class net_pars:
             self.cons_max = [0.005,  0.7,   0.30,  2.5]
 
         # NOTE: We intentionally remove padding. 
-        # The OG paper uses exact constraint limits.
+        # The Paulien Voorter paper uses exact constraint limits.
 
         # ----------------------
         # Device and result directory
