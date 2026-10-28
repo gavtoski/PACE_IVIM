@@ -13,6 +13,7 @@ See README.md for setup, data, commands, and the full citation.
 import argparse
 import contextlib
 import csv
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -38,6 +39,8 @@ RESULTS = REPO / "results"
 PARAMS = ("Dpar", "Dint", "Dmv", "Fint", "Fmv")
 DIFFUSIVITIES = {"Dpar", "Dint", "Dmv"}
 CONVENTIONAL_SEED = 19
+RETRAINED = "retrained"
+TRAINABLE = {"network", "ivim3c"}
 # A CPU run against Metal results differed by at most 2.06 percent in any one
 # file, from the backend's noise stream.
 COMPARE_TOLERANCE = 0.10
@@ -61,6 +64,7 @@ ARCHIVES = {
                  "training and validation sets, 1.7 GB"),
 }
 ARCHIVE_ROOTS = ("data/", "checkpoints/", "results/")
+ARCHIVE_DATA = "data/synthetic/"
 
 
 # Read the model and ablation registry from configs/arms.json:
@@ -76,10 +80,33 @@ class Arm:
     test_file: str
     infer_flags: list = field(default_factory=list)
     train_flags: list = field(default_factory=list)
+    released_tree: str = ""
+    released_checkpoint_tree: str = ""
 
     @property
     def key(self):
         return f"{self.tree}/{self.model}"
+
+
+def retrained(arm):
+    """The same arm, reading and writing under checkpoints/ and results/retrained/."""
+    if arm.kind not in TRAINABLE:
+        return arm
+    # IVIM3C_train.py writes its checkpoints under the same name as its results.
+    checkpoint_tree = arm.tree if arm.kind == "ivim3c" else arm.checkpoint_tree
+    return dataclasses.replace(
+        arm, tree=f"{RETRAINED}/{arm.tree}",
+        checkpoint_tree=f"{RETRAINED}/{checkpoint_tree}",
+        released_tree=arm.tree, released_checkpoint_tree=arm.checkpoint_tree)
+
+
+def released(arm):
+    """The released counterpart of a retrained arm; the arm itself otherwise."""
+    if not arm.released_tree:
+        return arm
+    return dataclasses.replace(arm, tree=arm.released_tree,
+                               checkpoint_tree=arm.released_checkpoint_tree,
+                               released_tree="", released_checkpoint_tree="")
 
 
 def load_registry():
@@ -154,6 +181,9 @@ def parse_args(argv=None):
     p.add_argument("--skip-inference", action="store_true", help="Reuse existing results")
     p.add_argument("--no-figures", action="store_true", help="Skip figures")
     p.add_argument("--compare-to", type=Path, metavar="DIR", help="Compare with earlier results")
+    p.add_argument("--train", action="store_true",
+                   help="Retrain the selected networks, then evaluate them")
+    p.add_argument("--epochs", type=int, help="Training epochs (default: 35, as in the manuscript)")
     p.add_argument("--no-download", action="store_true", help="Disable automatic downloads")
     p.add_argument("--download-only", nargs="+", choices=sorted(ARCHIVES), metavar="PART",
                    help="Download core, ablations, or training and exit")
@@ -193,6 +223,7 @@ class Plan:
     ablation: list
     main_snrs: list
     ablation_snr: int
+    train: bool = False
     jobs: dict = field(default_factory=dict)
     problems: list = field(default_factory=list)
 
@@ -207,7 +238,7 @@ def build_plan(args, settings, models, ablations):
         ablation = pick_arms(args.ablations, ablations, "ablation")
     plan = Plan(main=main, ablation=ablation,
                 main_snrs=sorted(args.snrs or settings["snrs"]),
-                ablation_snr=int(settings["ablation_snr"]))
+                ablation_snr=int(settings["ablation_snr"]), train=args.train)
 
     # Ablations are scored against PACE, so PACE runs at the ablation SNR too.
     work = [(arm, snr) for arm in main for snr in plan.main_snrs]
@@ -232,10 +263,11 @@ def build_plan(args, settings, models, ablations):
                 plan.problems.append(f"{arm.name} at {snr} dB: no results under "
                                      f"results/{arm.tree} to report")
             continue
-        seeds = keep_seeds(checkpoint_seeds(arm, snr), args.seeds)
+        source = released(arm) if args.train else arm
+        seeds = keep_seeds(checkpoint_seeds(source, snr), args.seeds)
         if not seeds:
             plan.problems.append(f"{arm.name} at {snr} dB: no checkpoints under "
-                                 f"checkpoints/{arm.checkpoint_tree}")
+                                 f"checkpoints/{source.checkpoint_tree}")
             continue
         plan.jobs[(arm.name, snr)] = (arm, snr, seeds)
     return plan
@@ -247,6 +279,10 @@ def data_problems(plan, paths):
         needed.add(test_path(arm, paths))
     for arm, _, _ in plan.jobs.values():
         needed.add(test_path(arm, paths))
+        if plan.train and arm.kind in TRAINABLE:
+            suffix = "_p5" if arm.test_file.endswith("_p5.h5") else ""
+            needed.add(Path(paths.data_dir) / f"synthetic_IVIM_train_2D{suffix}.h5")
+            needed.add(Path(paths.data_dir) / f"synthetic_IVIM_val_2D{suffix}.h5")
     return [f"missing data file: {shown(path)}"
             for path in sorted(needed) if not path.is_file()]
 
@@ -260,6 +296,11 @@ def print_plan(plan, args, paths):
               + f"  at {plan.ablation_snr} dB")
     if args.skip_inference:
         print("[plan ] inference skipped; reading existing results")
+    elif plan.train:
+        runs = sum(len(seeds) for arm, _, seeds in plan.jobs.values()
+                   if arm.kind in TRAINABLE)
+        print(f"[plan ] {runs} training run(s) of {args.epochs or 35} epoch(s) "
+              f"each, into checkpoints/{RETRAINED}/ and results/{RETRAINED}/")
     else:
         print(f"[plan ] {len(plan.jobs)} inference job(s)")
     print()
@@ -279,19 +320,34 @@ def part_present(part, paths):
 
 def needed_parts(args, paths):
     wanted = ["core"] + (["ablations"] if args.ablations is not None else [])
+    wanted += ["training"] if args.train else []
     return [part for part in wanted if not part_present(part, paths)]
 
 
 def extract_archive(path):
-    """Unpack into the repository, refusing any path outside the known folders."""
+    """Unpack data into the data folder (--data-dir) and weights into the
+    repository, refusing any path outside the known folders."""
+    data_dir = Path(data_paths().data_dir).resolve()
+    targets = []
     with zipfile.ZipFile(path) as zf:
         for item in zf.infolist():
             name = item.filename
-            dest = (REPO / name).resolve()
+            if name.startswith(ARCHIVE_DATA):
+                base, dest = data_dir, data_dir / name[len(ARCHIVE_DATA):]
+            else:
+                base, dest = REPO, REPO / name
+            dest = dest.resolve()
             if (not name.startswith(ARCHIVE_ROOTS) or ".." in Path(name).parts
-                    or not dest.is_relative_to(REPO)):
+                    or not dest.is_relative_to(base)):
                 raise RuntimeError(f"{path.name} holds an unexpected path: {name}")
-        zf.extractall(REPO)
+            targets.append((item, dest))
+        for item, dest in targets:
+            if item.is_dir():
+                dest.mkdir(parents=True, exist_ok=True)
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(item) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
 
 
 def download_archive(part):
@@ -322,7 +378,8 @@ def download_archive(part):
             raise RuntimeError(f"{name} failed its checksum; the download is "
                                f"incomplete or altered")
         extract_archive(zip_path)
-        print(f"[done ] {name} unpacked into the repository")
+        print(f"[done ] {name} unpacked; data in "
+              f"{shown(data_paths().data_dir)}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -339,9 +396,30 @@ def fetch(parts):
             print(f"        Download it from {RECORD_URL}, then unzip it inside "
                   f"this repository:", file=sys.stderr)
             print(f"        unzip {ARCHIVES[part][0]} -d {REPO}", file=sys.stderr)
+            if os.environ.get("PACE_DATA_DIR"):
+                print(f"        then move the files in data/synthetic/ to "
+                      f"{os.environ['PACE_DATA_DIR']}", file=sys.stderr)
             return False
     print()
     return True
+
+
+# Retrain, one command per arm and SNR, into checkpoints/retrained/:
+def training_command(arm, snr, seeds, args):
+    tail = ((["--epochs", str(args.epochs)] if args.epochs else [])
+            + (["--device", args.device] if args.device else [])
+            + (["--overwrite"] if args.overwrite else []))
+    seed_args = ["--seeds", *map(str, seeds)]
+    if arm.kind == "network":
+        return [sys.executable, str(SCRIPTS / "train_synthetic.py"),
+                "--models", arm.model, "--snrs", str(snr), *seed_args,
+                "--out", f"checkpoints/{arm.checkpoint_tree}", "--val-gt-metrics",
+                *arm.train_flags, *tail]
+    if arm.kind == "ivim3c":
+        # Trains and evaluates in one pass, writing results/<tree> itself.
+        return [sys.executable, str(SCRIPTS / "IVIM3C_train.py"),
+                "--snrs", str(snr), *seed_args, "--out", arm.tree, *tail]
+    return None
 
 
 # Run inference, one command per arm and SNR:
@@ -398,9 +476,19 @@ def run_command(label, command, dry_run):
 
 
 def run_inference(plan, args, paths):
-    """Run every job; return the names of arms with a failed job."""
+    """Train when asked, then run every job; return the arms with a failed job."""
     failed = set()
+    if plan.train:
+        for arm, snr, seeds in plan.jobs.values():
+            cmd = training_command(arm, snr, seeds, args)
+            if cmd is None:
+                continue
+            label = f"train {arm.name} at {snr} dB, seeds {', '.join(map(str, seeds))}"
+            if not run_command(label, cmd, args.dry_run):
+                failed.add(arm.name)
     for arm, snr, seeds in plan.jobs.values():
+        if arm.name in failed or (plan.train and arm.kind == "ivim3c"):
+            continue
         cmd = inference_command(arm, snr, seeds, args, paths)
         if cmd is None:
             continue
@@ -592,12 +680,13 @@ def compare_with_reference(engine, arms_snrs, reference_root):
     analyse, common, base = engine
     worst = {}
     for arm, snr in arms_snrs:
+        ref_arm = released(arm)
         seeds = sorted(set(result_seeds(RESULTS, arm, snr))
-                       & set(result_seeds(reference_root, arm, snr)))
+                       & set(result_seeds(reference_root, ref_arm, snr)))
         for seed in seeds:
             cur = analyse.one_seed(common, base, RESULTS, arm.tree, arm.model,
                                    snr, seed, None)
-            ref = analyse.one_seed(common, base, reference_root, arm.tree,
+            ref = analyse.one_seed(common, base, reference_root, ref_arm.tree,
                                    arm.model, snr, seed, None)
             for p in PARAMS:
                 a, b = cur["param_rmse"]["mean"][p], ref["param_rmse"]["mean"][p]
@@ -614,7 +703,8 @@ def table_gaps(engine, rows, snrs, group, seeds, reference_root):
     """Largest relative difference in the reported table values, per arm."""
     gaps = {}
     for arm, metrics in rows:
-        ref = arm_metrics(engine, arm, snrs, seeds, group, root=reference_root)
+        ref = arm_metrics(engine, released(arm), snrs, seeds, group,
+                          root=reference_root)
         if not ref:
             continue
         gaps[arm.name] = max(
@@ -623,19 +713,25 @@ def table_gaps(engine, rows, snrs, group, seeds, reference_root):
     return gaps
 
 
-def print_comparison(arms, worst, table, reference_root):
+def print_comparison(arms, worst, table, reference_root, judge=True):
     print(f"Comparison with {reference_root}")
     print("  largest relative difference in parameter RMSE, in the reported "
           "table and in the")
-    print(f"  worst single file; the worst file is judged, tolerance "
-          f"{COMPARE_TOLERANCE:.0%}")
+    if judge:
+        print(f"  worst single file; the worst file is judged, tolerance "
+              f"{COMPARE_TOLERANCE:.0%}")
+    else:
+        print("  worst single file; for information only, since retrained "
+              "weights are expected to differ")
     print(f"  {'':<16} {'table':>8}  {'worst file':>10}")
     for arm in arms:
         if arm.name not in worst or arm.name not in table:
             print(f"  {arm.name:<16} no matching reference files")
             continue
         gap, files = worst[arm.name]
-        if arm.kind == "ivim3c":
+        if not judge:
+            status = ""
+        elif arm.kind == "ivim3c":
             status = "not judged, external comparator"
         else:
             status = "OK" if gap <= COMPARE_TOLERANCE else "MISMATCH"
@@ -651,8 +747,16 @@ def main(argv=None):
         return 2
     args = parse_args(argv)
     settings, models, ablations = load_registry()
+    if args.train:
+        models = [retrained(arm) for arm in models]
+        ablations = [retrained(arm) for arm in ablations]
     if args.data_dir:
-        os.environ["PACE_DATA_DIR"] = str(args.data_dir.expanduser().resolve())
+        data_dir = args.data_dir.expanduser().resolve()
+        if not data_dir.is_dir():
+            print(f"[ERROR] --data-dir folder not found: {data_dir}",
+                  file=sys.stderr)
+            return 2
+        os.environ["PACE_DATA_DIR"] = str(data_dir)
     if args.list:
         print_registry(models, ablations)
         return 0
@@ -671,13 +775,18 @@ def main(argv=None):
     if problems:
         for problem in problems:
             print(f"[ERROR] {problem}", file=sys.stderr)
+        if plan.train and any("_train_" in p or "_val_" in p for p in problems):
+            where = f" --data-dir {args.data_dir}" if args.data_dir else ""
+            print("        Get the training data with: python run_PACE_IVIM.py "
+                  f"--download-only training{where}", file=sys.stderr)
         return 2
 
     # Inference.
     failed = set() if args.skip_inference else run_inference(plan, args, paths)
     if args.dry_run:
-        for label, command in figure_commands(plan, plan.main, plan.ablation):
-            run_command(label, command, True)
+        if not plan.train:
+            for label, command in figure_commands(plan, plan.main, plan.ablation):
+                run_command(label, command, True)
         return 0
 
     # Keep only arms that ran and match the test set.
@@ -721,37 +830,48 @@ def main(argv=None):
     report_tables(f"Ablations at {plan.ablation_snr} dB",
                   [(arm.label, m) for arm, m in ablation_rows])
 
-    RESULTS.mkdir(exist_ok=True)
-    write_csv(RESULTS / "summary.csv", [("model", main_rows),
+    out_dir = RESULTS / RETRAINED if plan.train else RESULTS
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(out_dir / "summary.csv", [("model", main_rows),
                                         ("ablation", ablation_rows)])
-    write_full_report(engine, RESULTS / "report.txt", plan,
+    write_full_report(engine, out_dir / "report.txt", plan,
                       [a for a, _ in main_rows],
                       [a for a, _ in ablation_rows if a is not baseline],
                       baseline, args)
 
     # Figures.
     fig_ok = True
-    if not args.no_figures:
+    if plan.train and not args.no_figures:
+        print("[skip ] figures are drawn for the released results; "
+              f"retrained results are in results/{RETRAINED}/summary.csv")
+    elif not args.no_figures:
         for label, command in figure_commands(plan, [a for a, _ in main_rows],
                                               [a for a, _ in ablation_rows
                                                if a is not baseline]):
             fig_ok &= run_command(label, command, False)
 
     # Optional comparison with an earlier run.
-    if args.compare_to:
-        ref_root = args.compare_to.expanduser().resolve()
-        worst = compare_with_reference(engine, report_pairs, ref_root)
+    if args.compare_to or plan.train:
+        ref_root = (args.compare_to.expanduser().resolve() if args.compare_to
+                    else RESULTS)
+        pairs = [(arm, snr) for arm, snr in report_pairs
+                 if not plan.train or arm.kind in TRAINABLE]
+        worst = compare_with_reference(engine, pairs, ref_root)
         table = table_gaps(engine, ablation_rows, [plan.ablation_snr],
                            "ablation", args.seeds, ref_root)
         table.update(table_gaps(engine, main_rows, plan.main_snrs, "model",
                                 args.seeds, ref_root))
-        compared = {a.name: a for a, _ in main_rows + ablation_rows}
-        print_comparison(list(compared.values()), worst, table, ref_root)
+        compared = {a.name: a for a, _ in main_rows + ablation_rows
+                    if not plan.train or a.kind in TRAINABLE}
+        print_comparison(list(compared.values()), worst, table, ref_root,
+                         judge=not plan.train)
 
     print("=" * 72)
-    print(f"[out  ] {(RESULTS / 'summary.csv').relative_to(REPO)}")
-    print(f"[out  ] {(RESULTS / 'report.txt').relative_to(REPO)}")
-    if not args.no_figures:
+    print(f"[out  ] {(out_dir / 'summary.csv').relative_to(REPO)}")
+    print(f"[out  ] {(out_dir / 'report.txt').relative_to(REPO)}")
+    if plan.train:
+        print(f"[out  ] checkpoints/{RETRAINED}/")
+    elif not args.no_figures:
         print("[out  ] figures/")
     if excluded:
         print(f"[warn ] not reported: {', '.join(sorted(excluded))}")

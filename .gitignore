@@ -7,3 +7,4 @@ checkpoints/
 results/
 figures/
 configs/paths.yaml
+*.log
