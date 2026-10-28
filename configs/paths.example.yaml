@@ -1,0 +1,16 @@
+# Where the synthetic data lives.
+#
+# Without configs/paths.yaml, every data file is read from data/synthetic
+# inside this repository, which is where run_PACE_IVIM.py downloads it.
+#
+# To keep the data elsewhere, copy this file to configs/paths.yaml and set
+# dir to the folder holding the files. Relative paths are taken from the
+# repository root. run_PACE_IVIM.py --data-dir overrides this file.
+
+data:
+  dir: /path/to/your/data
+
+  # Only if a single file sits outside dir:
+  # synthetic_test: /path/to/your/test/synthetic_IVIM_test_2D.h5
+  # synthetic_val: /path/to/your/validation/synthetic_IVIM_val_2D.h5
+  # bvals: /path/to/your/bvals/bval46.bval

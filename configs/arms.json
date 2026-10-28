@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "snrs": [20, 25, 30, 35],
+  "ablation_snr": 25,
+  "test_file": "synthetic_IVIM_test_2D.h5",
+  "models": [
+    {
+      "name": "PACE",
+      "label": "PACE",
+      "kind": "network",
+      "model": "pace",
+      "tree": "pace_nob0",
+      "infer_flags": ["--anat-token", "0", "--no-b0"],
+      "train_flags": ["--alpha-prior", "0", "--anat-token", "0", "--no-b0"]
+    },
+    {
+      "name": "PACE_prior",
+      "label": "PACE + spatial prior",
+      "kind": "network",
+      "model": "pace",
+      "tree": "pace_ansc_rel_a0.1",
+      "infer_flags": ["--anat-token", "0", "--no-b0"],
+      "train_flags": ["--alpha-prior", "0", "--anat-token", "0", "--no-b0", "--alpha-ansc", "0.1", "--ansc-target", "rel", "--ansc-tau", "0.5"]
+    },
+    {
+      "name": "DNN",
+      "label": "Signal-only DNN",
+      "kind": "network",
+      "model": "dnn",
+      "tree": "dnn_softmax_on",
+      "infer_flags": ["--softmax-fractions", "1", "--voorter-bounds", "0.3"],
+      "train_flags": ["--softmax-fractions", "1", "--voorter-bounds", "0.3"]
+    },
+    {
+      "name": "IVIM3C",
+      "label": "IVIM3C",
+      "kind": "ivim3c",
+      "model": "ivim3brain",
+      "tree": "synthetic",
+      "checkpoint_tree": "ivim3brain"
+    },
+    {
+      "name": "LSQ",
+      "label": "LSQ",
+      "kind": "conventional",
+      "model": "lsq",
+      "tree": "synthetic"
+    },
+    {
+      "name": "NNLS",
+      "label": "NNLS",
+      "kind": "conventional",
+      "model": "nnls",
+      "tree": "synthetic"
+    },
+    {
+      "name": "MAP",
+      "label": "MAP",
+      "kind": "conventional",
+      "model": "map",
+      "tree": "synthetic"
+    }
+  ],
+  "ablations": [
+    {
+      "name": "with_b0",
+      "label": "PACE, with b0",
+      "kind": "network",
+      "model": "pace",
+      "tree": "released_v1_with_b0",
+      "infer_flags": ["--anat-token", "0"],
+      "train_flags": ["--alpha-prior", "0", "--anat-token", "0"]
+    },
+    {
+      "name": "concat",
+      "label": "PACE-concat",
+      "kind": "network",
+      "model": "cnn_fusion",
+      "tree": "cnn_nob0",
+      "infer_flags": ["--anat-token", "0", "--no-b0"],
+      "train_flags": ["--alpha-prior", "0", "--anat-token", "0", "--no-b0"]
+    },
+    {
+      "name": "gates_closed",
+      "label": "PACE, gates closed",
+      "kind": "network",
+      "model": "pace",
+      "tree": "pace_nob0_gate0",
+      "infer_flags": ["--anat-token", "0", "--no-b0"],
+      "train_flags": ["--alpha-prior", "0", "--anat-token", "0", "--no-b0", "--freeze-gates", "0.0"]
+    },
+    {
+      "name": "no_ce",
+      "label": "PACE, no CE",
+      "kind": "network",
+      "model": "pace",
+      "tree": "pace_nob0_noce",
+      "infer_flags": ["--anat-token", "0", "--no-b0"],
+      "train_flags": ["--alpha-prior", "0", "--anat-token", "0", "--no-b0", "--alpha-ce", "0"]
+    },
+    {
+      "name": "patch_5x5",
+      "label": "PACE, 5x5 patch",
+      "kind": "network",
+      "model": "pace",
+      "tree": "pace_nob0_p5",
+      "infer_flags": ["--anat-token", "0", "--no-b0", "--patch-size", "5"],
+      "train_flags": ["--alpha-prior", "0", "--anat-token", "0", "--no-b0", "--patch-size", "5"],
+      "test_file": "synthetic_IVIM_test_2D_p5.h5"
+    },
+    {
+      "name": "neighbor_input",
+      "label": "PACE, neighbor input",
+      "kind": "network",
+      "model": "pace",
+      "tree": "pace_nb_anatselect",
+      "infer_flags": ["--anat-token", "0", "--ivim-nb", "--ivim-nb-anat-oracle"],
+      "train_flags": ["--alpha-prior", "0", "--anat-token", "0", "--ivim-nb", "--ivim-nb-anat-oracle"]
+    },
+    {
+      "name": "no_anatomy",
+      "label": "PACE, no anatomy",
+      "kind": "network",
+      "model": "pace",
+      "tree": "pace_nbonly",
+      "infer_flags": ["--anat-token", "0", "--ivim-nb", "--no-struct"],
+      "train_flags": ["--alpha-prior", "0", "--anat-token", "0", "--ivim-nb", "--no-struct"]
+    }
+  ]
+}
