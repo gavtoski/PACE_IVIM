@@ -1,6 +1,6 @@
 # PACE-IVIM
 
-**Physics-anchored Cross-attention Embedding (PACE)** is a multimodal deep learning framework for three-compartment IVIM parameter estimation. PACE integrates co-registered T1w and FLAIR spatial information with a physics-informed neural network through gated cross-attention. An additional anatomy-weighted spatial prior further reduces parameter RMSE with some distribution trade-off.
+**Physics-anchored Cross-attention Embedding (PACE)** is a multimodal deep learning framework for three-compartment IVIM parameter estimation. PACE integrates co-registered T1w and FLAIR spatial information with a physics-informed neural network through gated cross-attention. An additional anatomy-weighted spatial prior further reduces parameter RMSE with some distribution trade-offs.
 
 **Preprint (under peer review):** Hoang N, Faiyaz A, Mensah EA, Uddin MN, Zhong J, Schifitto G. *Improved three component IVIM fitting using physics-informed neural network with multimodal spatial prior.* arXiv:2610.28873 (2026). [Read preprint](https://arxiv.org/abs/2610.28873).
 
