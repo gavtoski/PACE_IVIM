@@ -1,59 +1,35 @@
 #!/usr/bin/env python3
-"""Reproduce the synthetic results of the PACE manuscript.
+"""Reproduce the synthetic PACE-IVIM results (models and ablations).
 
-PACE estimates three compartment IVIM parameters from diffusion weighted
-brain MRI, conditioning a physics informed neural network on co-registered
-anatomical context (T1 and FLAIR) through gated cross attention.
+PACE: physics-informed three-compartment IVIM fitting with gated
+cross-attention to T1w/FLAIR. Optional anatomy-weighted spatial prior.
 
-DISCLAIMER
-    This work is under peer review. The method, code and reported numbers
-    may change before publication. Until then, please cite the preprint.
-
-If you use this code, please cite:
-
-    Hoang N, Faiyaz A, Mensah EA, Uddin MN, Zhong J, Schifitto G.
-    Improved three component IVIM fitting using physics-informed neural
-    network with multimodal spatial prior. arXiv:2610.28873 [eess.IV];
-    2026. https://arxiv.org/abs/2610.28873
-
-The IVIM3C comparator and the three compartment model follow:
-
-    Voorter PHM, Backes WH, Gurney-Champion OJ, Wong S-M, Staals J,
-    van Oostenbrugge RJ, van der Thiel MM, Jansen JFA, Drenthen GS.
-    Improving microstructural integrity, interstitial fluid, and blood
-    microcirculation images from multi-b-value diffusion MRI using
-    physics-informed neural networks in cerebrovascular disease. Magnetic
-    Resonance in Med. 2023;90(4):1657-71. doi: 10.1002/mrm.29753.
-
-Spatial information in deep learning IVIM estimation:
-
-    Kaandorp MPT, Zijlstra F, Karimi D, Gholipour A, While PT.
-    Incorporating spatial information in deep learning parameter
-    estimation with application to the intravoxel incoherent motion model
-    in diffusion-weighted MRI. Medical Image Analysis. 2025;101:103414.
-    doi: 10.1016/j.media.2024.103414.
-
-Usage:
-    python run_PACE_IVIM.py
-    python run_PACE_IVIM.py --models PACE DNN LSQ
-    python run_PACE_IVIM.py --ablations
-    python run_PACE_IVIM.py --conventional
-    python run_PACE_IVIM.py --list
+Citation: Hoang et al. (2026), arXiv:2610.28873.
+Comparator: Voorter et al. (2023), doi:10.1002/mrm.29753.
+Related work: Kaandorp et al. (2025), doi:10.1016/j.media.2024.103414.
+See README.md for setup, data, commands, and the full citation.
 """
 
 import argparse
 import contextlib
 import csv
+import hashlib
 import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
+import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Repository layout and fixed settings:
 REPO = Path(__file__).resolve().parent
 CONFIG = REPO / "configs" / "arms.json"
 SCRIPTS = REPO / "scripts"
@@ -68,12 +44,28 @@ COMPARE_TOLERANCE = 0.10
 RESULT_FILE_RE = re.compile(r"^inferred_seed(?P<seed>\d+)\.h5$")
 RUN_DIR_RE = re.compile(r"^(?P<model>.+)_snr(?P<snr>\d+)_seed(?P<seed>\d+)$")
 
+# Zenodo record holding the data and weights; each archive unpacks into
+# data/, checkpoints/ and results/ at the repository root:
+ZENODO_RECORD = "23746536"
+RECORD_URL = f"https://zenodo.org/records/{ZENODO_RECORD}"
+DOWNLOAD_BASE = os.environ.get("PACE_DOWNLOAD_BASE", f"{RECORD_URL}/files")
+ARCHIVES = {
+    "core": ("PACE_IVIM_core.zip",
+             "9edea2ea87fd1348844f03f8386128bd64fe34d86608ba648ed49d28653a4f55",
+             "test set, b-values, weights of the four networks, conventional fits"),
+    "ablations": ("PACE_IVIM_ablations.zip",
+                  "c7381b64a404a5d6ffcf9c7f7b2cb590516f03f2d1c9ad633f881ce0f39c4575",
+                  "5x5 test set and weights of the seven ablation arms"),
+    "training": ("PACE_IVIM_training.zip",
+                 "b6623c8260e4b9a7117e909c5d3a41b6300559b16ad02c1e3dc10bf2a8bb615e",
+                 "training and validation sets, 1.7 GB"),
+}
+ARCHIVE_ROOTS = ("data/", "checkpoints/", "results/")
 
-# Registry
 
+# Read the model and ablation registry from configs/arms.json:
 @dataclass
 class Arm:
-    """One model or ablation arm, as listed in configs/arms.json."""
     name: str
     label: str
     group: str
@@ -91,7 +83,7 @@ class Arm:
 
 
 def load_registry():
-    """Return (settings, models, ablations) from configs/arms.json."""
+    """Return (settings, models, ablations)."""
     doc = json.loads(CONFIG.read_text(encoding="utf-8"))
     lists = {}
     for group, singular in (("models", "model"), ("ablations", "ablation")):
@@ -107,28 +99,8 @@ def load_registry():
     return doc, lists["models"], lists["ablations"]
 
 
-def data_paths():
-    """Resolved data locations, honoring --data-dir and configs/paths.yaml."""
-    sys.path.insert(0, str(REPO))
-    from pace import common
-    return common.load_paths()
-
-
-def test_path(arm, paths):
-    """The test file an arm is run on, inside the data folder."""
-    if arm.test_file == Path(paths.synthetic_test).name:
-        return Path(paths.synthetic_test)
-    return Path(paths.data_dir) / arm.test_file
-
-
-def shown(path):
-    """A path relative to the repository when inside it, absolute otherwise."""
-    path = Path(path)
-    return str(path.relative_to(REPO)) if path.is_relative_to(REPO) else str(path)
-
-
 def pick_arms(names, pool, what):
-    """Arms named in names, case insensitive, in registry order."""
+    """Arms matching names, case insensitive, in registry order."""
     wanted = {name.lower() for name in names}
     known = {arm.name.lower() for arm in pool}
     unknown = sorted(wanted - known)
@@ -147,55 +119,51 @@ def print_registry(models, ablations):
         print()
 
 
-# Arguments
+# Helpers to check file paths:
+def data_paths():
+    """Resolved data locations, so it follows --data-dir and configs/paths.yaml."""
+    sys.path.insert(0, str(REPO))
+    from pace import common
+    return common.load_paths()
 
+
+def test_path(arm, paths):
+    if arm.test_file == Path(paths.synthetic_test).name:
+        return Path(paths.synthetic_test)
+    return Path(paths.data_dir) / arm.test_file
+
+
+def shown(path):
+    path = Path(path)
+    return str(path.relative_to(REPO)) if path.is_relative_to(REPO) else str(path)
+
+
+# Parse command line options:
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Reproduce the synthetic results of the PACE manuscript.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Run with --list to see every model and ablation name.")
-    parser.add_argument("--models", nargs="+", default=None, metavar="NAME",
-                        help="Models to report, by name. Default: all seven.")
-    parser.add_argument("--ablations", nargs="*", default=None, metavar="NAME",
-                        help="Add ablation arms at the ablation SNR. Given "
-                             "alone, adds all of them.")
-    parser.add_argument("--conventional", action="store_true",
-                        help="Refit LSQ, NNLS and MAP instead of reading the "
-                             "fits that come with the data. Slower.")
-    parser.add_argument("--data-dir", type=Path, default=None, metavar="DIR",
-                        help="Folder holding the synthetic data files. "
-                             "Default: data/synthetic in this repository, or "
-                             "the folder set in configs/paths.yaml.")
-    parser.add_argument("--snrs", nargs="+", type=int, default=None,
-                        help="Noise levels for the models. Default: 20 25 30 35.")
-    parser.add_argument("--seeds", nargs="+", type=int, default=None,
-                        help="Restrict to these seeds. Default: every seed "
-                             "with a checkpoint.")
-    parser.add_argument("--device", default=None,
-                        help="cuda, mps or cpu. Default: whichever is present.")
-    parser.add_argument("--overwrite", action="store_true",
-                        help="Rerun inference even where results exist.")
-    parser.add_argument("--skip-inference", action="store_true",
-                        help="Only compute metrics and figures from the "
-                             "results already present.")
-    parser.add_argument("--no-figures", action="store_true")
-    parser.add_argument("--compare-to", type=Path, default=None, metavar="DIR",
-                        help="A results folder from an earlier run, to "
-                             "compare the new results against.")
-    parser.add_argument("--skip-flag-check", action="store_true",
-                        help="Do not compare inference flags with the "
-                             "architecture recorded beside each checkpoint.")
-    parser.add_argument("--list", action="store_true",
-                        help="List every model and ablation, then exit.")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print the plan and the commands, then exit.")
-    return parser.parse_args(argv)
+    p = argparse.ArgumentParser(
+        description="Reproduce the synthetic PACE-IVIM results.",
+        epilog="Use --list for model and ablation names.")
+    p.add_argument("--models", nargs="+", metavar="NAME", help="Models (default: all seven)")
+    p.add_argument("--ablations", nargs="*", metavar="NAME", help="Add selected or all ablations")
+    p.add_argument("--conventional", action="store_true", help="Refit LSQ/NNLS/MAP")
+    p.add_argument("--data-dir", type=Path, metavar="DIR", help="Synthetic data directory")
+    p.add_argument("--snrs", nargs="+", type=int, help="SNRs (default: 20 25 30 35)")
+    p.add_argument("--seeds", nargs="+", type=int, help="Restrict to these seeds")
+    p.add_argument("--device", help="cuda, mps, or cpu (default: auto)")
+    p.add_argument("--overwrite", action="store_true", help="Rerun inference")
+    p.add_argument("--skip-inference", action="store_true", help="Reuse existing results")
+    p.add_argument("--no-figures", action="store_true", help="Skip figures")
+    p.add_argument("--compare-to", type=Path, metavar="DIR", help="Compare with earlier results")
+    p.add_argument("--no-download", action="store_true", help="Disable automatic downloads")
+    p.add_argument("--download-only", nargs="+", choices=sorted(ARCHIVES), metavar="PART",
+                   help="Download core, ablations, or training and exit")
+    p.add_argument("--list", action="store_true", help="List models and ablations")
+    p.add_argument("--dry-run", action="store_true", help="Print planned commands only")
+    return p.parse_args(argv)
 
 
-# Plan
-
+# Plan the run: which arms, SNRs and seeds, and what is missing:
 def checkpoint_seeds(arm, snr):
-    """Seeds with a checkpoint for one arm at one SNR."""
     root = REPO / "checkpoints" / arm.checkpoint_tree
     seeds = []
     if root.is_dir():
@@ -208,7 +176,6 @@ def checkpoint_seeds(arm, snr):
 
 
 def result_seeds(root, arm, snr):
-    """Seeds with an inference file for one arm at one SNR."""
     folder = root / arm.tree / f"{arm.model}_snr{snr}"
     if not folder.is_dir():
         return []
@@ -222,7 +189,6 @@ def keep_seeds(seeds, wanted):
 
 @dataclass
 class Plan:
-    """What this run reports, and what it has to compute first."""
     main: list
     ablation: list
     main_snrs: list
@@ -239,11 +205,11 @@ def build_plan(args, settings, models, ablations):
         ablation = list(ablations)
     else:
         ablation = pick_arms(args.ablations, ablations, "ablation")
-
     plan = Plan(main=main, ablation=ablation,
                 main_snrs=sorted(args.snrs or settings["snrs"]),
                 ablation_snr=int(settings["ablation_snr"]))
 
+    # Ablations are scored against PACE, so PACE runs at the ablation SNR too.
     work = [(arm, snr) for arm in main for snr in plan.main_snrs]
     work += [(arm, plan.ablation_snr) for arm in ablation]
     if ablation:
@@ -276,7 +242,6 @@ def build_plan(args, settings, models, ablations):
 
 
 def data_problems(plan, paths):
-    """Data files the plan needs that are missing."""
     needed = {Path(paths.bvals), Path(paths.synthetic_test)}
     for arm in plan.main + plan.ablation:
         needed.add(test_path(arm, paths))
@@ -300,115 +265,87 @@ def print_plan(plan, args, paths):
     print()
 
 
-# Flag check
+# Download missing data and weights from Zenodo, verified by SHA256:
+def part_present(part, paths):
+    data = Path(paths.data_dir)
+    if part == "core":
+        return (Path(paths.synthetic_test).is_file() and Path(paths.bvals).is_file()
+                and (REPO / "checkpoints" / "pace_nob0").is_dir())
+    if part == "ablations":
+        return ((data / "synthetic_IVIM_test_2D_p5.h5").is_file()
+                and (REPO / "checkpoints" / "pace_nbonly").is_dir())
+    return (data / "synthetic_IVIM_train_2D.h5").is_file()
 
-def flag_value(flags, name):
-    """Value after a flag, True for a bare flag, None when absent."""
-    if name not in flags:
-        return None
-    index = flags.index(name)
-    if index + 1 < len(flags) and not flags[index + 1].startswith("--"):
-        return flags[index + 1]
+
+def needed_parts(args, paths):
+    wanted = ["core"] + (["ablations"] if args.ablations is not None else [])
+    return [part for part in wanted if not part_present(part, paths)]
+
+
+def extract_archive(path):
+    """Unpack into the repository, refusing any path outside the known folders."""
+    with zipfile.ZipFile(path) as zf:
+        for item in zf.infolist():
+            name = item.filename
+            dest = (REPO / name).resolve()
+            if (not name.startswith(ARCHIVE_ROOTS) or ".." in Path(name).parts
+                    or not dest.is_relative_to(REPO)):
+                raise RuntimeError(f"{path.name} holds an unexpected path: {name}")
+        zf.extractall(REPO)
+
+
+def download_archive(part):
+    """Download one archive, verify its SHA256, unpack it, delete the zip."""
+    name, digest, about = ARCHIVES[part]
+    print(f"[fetch] {name}: {about}")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pace_download_"))
+    zip_path = tmp_dir / name
+    try:
+        sha = hashlib.sha256()
+        req = urllib.request.Request(f"{DOWNLOAD_BASE}/{name}?download=1",
+                                     headers={"User-Agent": "run_PACE_IVIM"})
+        with urllib.request.urlopen(req, timeout=60) as resp, \
+                open(zip_path, "wb") as out:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done, step_shown = 0, -1
+            while chunk := resp.read(1 << 20):
+                out.write(chunk)
+                sha.update(chunk)
+                done += len(chunk)
+                step = int(20 * done / total) if total else done >> 26
+                if step != step_shown:
+                    step_shown = step
+                    size = f" of {total / 1e6:.0f}" if total else ""
+                    print(f"\r        {done / 1e6:.0f}{size} MB", end="", flush=True)
+        print()
+        if sha.hexdigest() != digest:
+            raise RuntimeError(f"{name} failed its checksum; the download is "
+                               f"incomplete or altered")
+        extract_archive(zip_path)
+        print(f"[done ] {name} unpacked into the repository")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def fetch(parts):
+    """Download each part; on failure, print the manual route."""
+    for part in parts:
+        try:
+            download_archive(part)
+        except (urllib.error.URLError, OSError, RuntimeError,
+                zipfile.BadZipFile) as error:
+            print(f"[ERROR] could not download {ARCHIVES[part][0]}: {error}",
+                  file=sys.stderr)
+            print(f"        Download it from {RECORD_URL}, then unzip it inside "
+                  f"this repository:", file=sys.stderr)
+            print(f"        unzip {ARCHIVES[part][0]} -d {REPO}", file=sys.stderr)
+            return False
+    print()
     return True
 
 
-def read_summary(arm):
-    """Scalar fields of the first summary beside one of the arm's checkpoints."""
-    import numpy as np
-    root = REPO / "checkpoints" / arm.checkpoint_tree
-    for run in sorted(root.glob(f"{arm.model}_snr*_seed*")):
-        files = sorted(run.glob("summary_*.npz"))
-        if not files:
-            continue
-        doc = np.load(files[0], allow_pickle=True)
-        out = {}
-        for key in doc.files:
-            if doc[key].size == 1:
-                out[key] = doc[key].item()
-        return out
-    return {}
-
-
-def flag_problems(arm, summary):
-    """Disagreements between the inference flags and the recorded architecture.
-
-    Only fields the summary records are checked. The neighbor oracle
-    options are not recorded, so they rest on the reference comparison.
-    """
-    flags, problems = arm.infer_flags, []
-    spatial = bool(summary.get("spatial_on", True))
-
-    def expect(condition, message):
-        if not condition:
-            problems.append(message)
-
-    if spatial and "use_b0" in summary:
-        has = flag_value(flags, "--no-b0") is not None
-        expect(has == (not summary["use_b0"]),
-               f"summary use_b0={summary['use_b0']}, flags "
-               f"{'include' if has else 'omit'} --no-b0")
-    if spatial and "use_struct" in summary:
-        has = flag_value(flags, "--no-struct") is not None
-        expect(has == (not summary["use_struct"]),
-               f"summary use_struct={summary['use_struct']}, flags "
-               f"{'include' if has else 'omit'} --no-struct")
-    neighbors = summary.get("use_ivim_nb")
-    if neighbors is None and "b0_channels" in summary:
-        neighbors = int(summary["b0_channels"]) > 1
-    if spatial and neighbors is not None:
-        has = flag_value(flags, "--ivim-nb") is not None
-        expect(has == bool(neighbors),
-               f"summary records neighbor input={bool(neighbors)}, flags "
-               f"{'include' if has else 'omit'} --ivim-nb")
-    if spatial and "use_anat_token" in summary:
-        value = flag_value(flags, "--anat-token")
-        token_on = value is None or str(value) != "0"
-        expect(token_on == bool(summary["use_anat_token"]),
-               f"summary use_anat_token={summary['use_anat_token']}, flags "
-               f"give {token_on}")
-    if "widen_bounds" in summary:
-        value = flag_value(flags, "--voorter-bounds")
-        if value is not True:
-            given = 0.0 if value is None else float(value)
-            expect(abs(given - float(summary["widen_bounds"])) < 1e-9,
-                   f"summary widen_bounds={summary['widen_bounds']}, flags "
-                   f"give {given}")
-    if "patch_size" in summary:
-        value = flag_value(flags, "--patch-size")
-        given = 3 if value in (None, True) else int(value)
-        expect(given == int(summary["patch_size"]),
-               f"summary patch_size={summary['patch_size']}, flags give {given}")
-    if not spatial and "use_softmax_fractions" in summary:
-        value = flag_value(flags, "--softmax-fractions")
-        given = value is not None and str(value) != "0"
-        expect(given == bool(summary["use_softmax_fractions"]),
-               f"summary use_softmax_fractions="
-               f"{summary['use_softmax_fractions']}, flags give {given}")
-    return problems
-
-
-def check_flags(plan):
-    """Return a list of problems across every network arm in the plan."""
-    problems, seen = [], set()
-    for arm, _, _ in plan.jobs.values():
-        if arm.kind != "network" or arm.name in seen:
-            continue
-        seen.add(arm.name)
-        summary = read_summary(arm)
-        if not summary:
-            print(f"[flags] {arm.name}: no summary file, not checked")
-            continue
-        found = flag_problems(arm, summary)
-        print(f"[flags] {arm.name}: "
-              + ("consistent" if not found else f"{len(found)} problem(s)"))
-        problems += [f"{arm.name}: {p}" for p in found]
-    return problems
-
-
-# Inference
-
+# Run inference, one command per arm and SNR:
 def inference_command(arm, snr, seeds, args, paths):
-    """The command for one job, or None for a kind with no inference."""
     tail = (["--device", args.device] if args.device else [])
     seed_args = ["--seeds", *map(str, seeds)]
     if arm.kind == "network":
@@ -432,31 +369,30 @@ def conventional_commands(plan):
     for arm, snr, _ in plan.jobs.values():
         if arm.kind == "conventional":
             by_snr.setdefault(snr, []).append(arm)
-    commands = []
+    cmds = []
     for snr, arms in sorted(by_snr.items()):
         methods = [arm.name.upper() for arm in arms]
-        commands.append((f"{'/'.join(methods)} at {snr} dB", [
+        cmds.append((f"{'/'.join(methods)} at {snr} dB", [
             sys.executable, str(SCRIPTS / "fit_conventional.py"),
             "--snr", str(snr), "--seed", str(CONVENTIONAL_SEED),
             "--out", f"results/{arms[0].tree}", "--methods", *methods]))
-    return commands
+    return cmds
 
 
 def run_command(label, command, dry_run):
-    """Run one command from the repository root. Returns True on success."""
-    shown = " ".join(["python"] + [str(Path(c).relative_to(REPO))
-                                   if c.startswith(str(REPO)) else c
-                                   for c in command[1:]])
+    cmd_text = " ".join(["python"] + [str(Path(c).relative_to(REPO))
+                                      if c.startswith(str(REPO)) else c
+                                      for c in command[1:]])
     print(f"[run  ] {label}")
-    print(f"        {shown}")
+    print(f"        {cmd_text}")
     if dry_run:
         return True
     sys.stdout.flush()
-    start = time.time()
+    t0 = time.time()
     code = subprocess.run(command, cwd=REPO).returncode
     status = "ok" if code == 0 else f"FAILED, exit {code}"
     print(f"[{'done ' if code == 0 else 'FAIL '}] {label}: {status}, "
-          f"{time.time() - start:.0f}s")
+          f"{time.time() - t0:.0f}s")
     print()
     return code == 0
 
@@ -465,28 +401,22 @@ def run_inference(plan, args, paths):
     """Run every job; return the names of arms with a failed job."""
     failed = set()
     for arm, snr, seeds in plan.jobs.values():
-        command = inference_command(arm, snr, seeds, args, paths)
-        if command is None:
+        cmd = inference_command(arm, snr, seeds, args, paths)
+        if cmd is None:
             continue
         label = f"{arm.name} at {snr} dB, seeds {', '.join(map(str, seeds))}"
-        if not run_command(label, command, args.dry_run):
+        if not run_command(label, cmd, args.dry_run):
             failed.add(arm.name)
-    for label, command in conventional_commands(plan):
-        if not run_command(label, command, args.dry_run):
+    for label, cmd in conventional_commands(plan):
+        if not run_command(label, cmd, args.dry_run):
             failed.update(arm.name for arm, _, _ in plan.jobs.values()
                           if arm.kind == "conventional")
     return failed
 
 
-# Phantom guard
-
+# Exclude results whose tissue labels do not match the test set, since every
+# metric takes its ground truth from the test set:
 def phantom_problems(arms_snrs, reference_h5):
-    """Result files whose tissue labels differ from the scoring test set.
-
-    Every metric takes its ground truth from the test set, so a result
-    produced on a different phantom, or in a different voxel order, would
-    be scored against the wrong truth without any error.
-    """
     import h5py
     import numpy as np
     with h5py.File(reference_h5, "r") as handle:
@@ -507,10 +437,8 @@ def phantom_problems(arms_snrs, reference_h5):
     return bad
 
 
-# Metrics
-
+# Compute metrics with scripts/analyse_arms.py, the same code the figures use:
 def load_engine():
-    """The metric functions of scripts/analyse_arms.py and the pace helpers."""
     sys.path.insert(0, str(REPO))
     from pace import common
     spec = importlib.util.spec_from_file_location("analyse_arms",
@@ -521,8 +449,6 @@ def load_engine():
 
 
 def cnr_rmse(results, parameter):
-    """Root mean square distance of the predicted lesion CNR from the truth,
-    defined as in the figure scripts."""
     import numpy as np
     predicted = np.asarray([r["cnr_pred"][parameter] for r in results], float)
     truth = np.asarray([r["cnr_true"][parameter] for r in results], float)
@@ -533,15 +459,7 @@ def cnr_rmse(results, parameter):
 
 
 def arm_metrics(engine, arm, snrs, seeds_wanted, group, root=RESULTS):
-    """Summary metrics for one arm, averaged as its manuscript figure does.
-
-    Seeds are averaged within an SNR, then SNRs equally. group decides
-    the remaining two choices as the matching figure makes them: lesion
-    CNR RMSE pools the SNR means for the model comparison and every seed
-    for the ablations, and signal RMSE is pooled over voxels for the first
-    and averaged over tissues for the second. The seed filter does not
-    apply to conventional fits, which have a single seed.
-    """
+    """Seeds averaged within an SNR, then SNRs equally, as in the figures."""
     analyse, common, base = engine
     if arm.kind == "conventional":
         seeds_wanted = None
@@ -556,6 +474,8 @@ def arm_metrics(engine, arm, snrs, seeds_wanted, group, root=RESULTS):
     if not per_snr:
         return None
     overall = analyse._mean_of(per_snr) if len(per_snr) > 1 else per_snr[0]
+    # The ablation heatmap pools every seed and averages signal over tissues;
+    # the model comparison pools the SNR means and pools signal over voxels.
     pool = every if group == "ablation" else per_snr
     signal_key = "mean" if group == "ablation" else "all"
     return {
@@ -567,8 +487,8 @@ def arm_metrics(engine, arm, snrs, seeds_wanted, group, root=RESULTS):
     }
 
 
+# Print and save the summary tables and the full report:
 def three_sig(value):
-    """Three significant figures in plain decimal notation."""
     import math
     if value is None or not math.isfinite(value):
         return "-"
@@ -594,7 +514,6 @@ def scaled(metrics, parameter):
 
 
 def report_tables(title, rows):
-    """Print the parameter and contrast tables for one group of arms."""
     if not rows:
         return
     print_table(f"{title}: signal and parameter RMSE "
@@ -606,7 +525,7 @@ def report_tables(title, rows):
 
 
 def write_csv(path, groups):
-    """Raw values, diffusivity RMSE in mm^2/s."""
+    """Raw values; diffusivity RMSE in mm^2/s."""
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(["group", "name", "label", "tree", "model", "snrs",
@@ -647,43 +566,41 @@ def write_full_report(engine, path, plan, main_arms, ablation_arms, baseline, ar
             handle.write("\n")
 
 
-# Figures
-
+# Draw figures for the selected arms:
 def figure_commands(plan, main_arms, ablation_arms):
-    commands = []
+    cmds = []
     if len(main_arms) >= 2:
         snrs = plan.main_snrs
-        distribution = 25 if 25 in snrs else snrs[0]
-        commands.append(("model comparison figures", [
+        dist_snr = 25 if 25 in snrs else snrs[0]
+        cmds.append(("model comparison figures", [
             sys.executable, str(SCRIPTS / "make_model_comparison.py"),
-            "--snrs", *map(str, snrs), "--distribution-snr", str(distribution),
+            "--snrs", *map(str, snrs), "--distribution-snr", str(dist_snr),
             "--select", *[arm.key for arm in main_arms]]))
     elif main_arms:
         print("[skip ] model comparison figures need at least two models")
     if ablation_arms:
-        commands.append(("ablation heatmaps", [
+        cmds.append(("ablation heatmaps", [
             sys.executable, str(SCRIPTS / "make_ablation_heatmaps.py"),
             "--snr", str(plan.ablation_snr),
             "--select", *[arm.key for arm in ablation_arms]]))
-    return commands
+    return cmds
 
 
-# Reference comparison
-
+# Compare results with an earlier run (--compare-to), per file and per table:
 def compare_with_reference(engine, arms_snrs, reference_root):
-    """Largest relative difference in parameter RMSE, per arm, per file."""
+    """Largest relative difference in parameter RMSE in any single file, per arm."""
     analyse, common, base = engine
     worst = {}
     for arm, snr in arms_snrs:
-        shared = sorted(set(result_seeds(RESULTS, arm, snr))
-                        & set(result_seeds(reference_root, arm, snr)))
-        for seed in shared:
-            new = analyse.one_seed(common, base, RESULTS, arm.tree, arm.model,
+        seeds = sorted(set(result_seeds(RESULTS, arm, snr))
+                       & set(result_seeds(reference_root, arm, snr)))
+        for seed in seeds:
+            cur = analyse.one_seed(common, base, RESULTS, arm.tree, arm.model,
                                    snr, seed, None)
-            old = analyse.one_seed(common, base, reference_root, arm.tree,
+            ref = analyse.one_seed(common, base, reference_root, arm.tree,
                                    arm.model, snr, seed, None)
             for p in PARAMS:
-                a, b = new["param_rmse"]["mean"][p], old["param_rmse"]["mean"][p]
+                a, b = cur["param_rmse"]["mean"][p], ref["param_rmse"]["mean"][p]
                 if b:
                     gap = abs(a - b) / abs(b)
                     entry = worst.setdefault(arm.name, [0.0, 0])
@@ -694,19 +611,15 @@ def compare_with_reference(engine, arms_snrs, reference_root):
 
 
 def table_gaps(engine, rows, snrs, group, seeds, reference_root):
-    """Largest relative difference in the reported parameter RMSE, per arm.
-
-    These are the values the summary table prints, averaged over seeds and
-    SNRs, which is what a reader compares against the manuscript.
-    """
+    """Largest relative difference in the reported table values, per arm."""
     gaps = {}
     for arm, metrics in rows:
-        reference = arm_metrics(engine, arm, snrs, seeds, group, root=reference_root)
-        if not reference:
+        ref = arm_metrics(engine, arm, snrs, seeds, group, root=reference_root)
+        if not ref:
             continue
         gaps[arm.name] = max(
-            abs(metrics["rmse"][p] - reference["rmse"][p]) / abs(reference["rmse"][p])
-            for p in PARAMS if reference["rmse"][p])
+            abs(metrics["rmse"][p] - ref["rmse"][p]) / abs(ref["rmse"][p])
+            for p in PARAMS if ref["rmse"][p])
     return gaps
 
 
@@ -731,8 +644,7 @@ def print_comparison(arms, worst, table, reference_root):
     print()
 
 
-# Main
-
+# Main:
 def main(argv=None):
     if sys.version_info < (3, 10):
         print("[ERROR] Python 3.10 or newer is required.", file=sys.stderr)
@@ -745,7 +657,14 @@ def main(argv=None):
         print_registry(models, ablations)
         return 0
 
+    # Fetch whatever this run needs, then plan it.
     paths = data_paths()
+    if args.download_only:
+        return 0 if fetch(args.download_only) else 1
+    if not args.no_download:
+        missing = needed_parts(args, paths)
+        if missing and not fetch(missing):
+            return 2
     plan = build_plan(args, settings, models, ablations)
     print_plan(plan, args, paths)
     problems = plan.problems + data_problems(plan, paths)
@@ -753,22 +672,15 @@ def main(argv=None):
         for problem in problems:
             print(f"[ERROR] {problem}", file=sys.stderr)
         return 2
-    if not args.skip_inference and not args.skip_flag_check:
-        flag_errors = check_flags(plan)
-        if flag_errors:
-            for problem in flag_errors:
-                print(f"[ERROR] {problem}", file=sys.stderr)
-            print("[ERROR] fix configs/arms.json, or pass --skip-flag-check",
-                  file=sys.stderr)
-            return 2
-        print()
 
+    # Inference.
     failed = set() if args.skip_inference else run_inference(plan, args, paths)
     if args.dry_run:
         for label, command in figure_commands(plan, plan.main, plan.ablation):
             run_command(label, command, True)
         return 0
 
+    # Keep only arms that ran and match the test set.
     baseline = next(arm for arm in models if arm.name == "PACE")
     report_pairs = [(arm, snr) for arm in plan.main for snr in plan.main_snrs]
     report_pairs += [(arm, plan.ablation_snr) for arm in plan.ablation]
@@ -790,6 +702,7 @@ def main(argv=None):
               "reported", file=sys.stderr)
         ablation_arms = []
 
+    # Metrics, tables and the full report.
     engine = load_engine()
     main_rows = [(arm, arm_metrics(engine, arm, plan.main_snrs, args.seeds,
                                    "model"))
@@ -816,22 +729,24 @@ def main(argv=None):
                       [a for a, _ in ablation_rows if a is not baseline],
                       baseline, args)
 
-    figures_ok = True
+    # Figures.
+    fig_ok = True
     if not args.no_figures:
         for label, command in figure_commands(plan, [a for a, _ in main_rows],
                                               [a for a, _ in ablation_rows
                                                if a is not baseline]):
-            figures_ok &= run_command(label, command, False)
+            fig_ok &= run_command(label, command, False)
 
+    # Optional comparison with an earlier run.
     if args.compare_to:
-        reference = args.compare_to.expanduser().resolve()
-        worst = compare_with_reference(engine, report_pairs, reference)
+        ref_root = args.compare_to.expanduser().resolve()
+        worst = compare_with_reference(engine, report_pairs, ref_root)
         table = table_gaps(engine, ablation_rows, [plan.ablation_snr],
-                           "ablation", args.seeds, reference)
+                           "ablation", args.seeds, ref_root)
         table.update(table_gaps(engine, main_rows, plan.main_snrs, "model",
-                                args.seeds, reference))
+                                args.seeds, ref_root))
         compared = {a.name: a for a, _ in main_rows + ablation_rows}
-        print_comparison(list(compared.values()), worst, table, reference)
+        print_comparison(list(compared.values()), worst, table, ref_root)
 
     print("=" * 72)
     print(f"[out  ] {(RESULTS / 'summary.csv').relative_to(REPO)}")
@@ -840,7 +755,7 @@ def main(argv=None):
         print("[out  ] figures/")
     if excluded:
         print(f"[warn ] not reported: {', '.join(sorted(excluded))}")
-    return 0 if not excluded and figures_ok else 1
+    return 0 if not excluded and fig_ok else 1
 
 
 if __name__ == "__main__":
