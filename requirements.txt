@@ -9,5 +9,3 @@ joblib
 pyyaml
 tqdm
 scikit-image
-joblib
-tqdm
